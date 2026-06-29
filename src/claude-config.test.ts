@@ -1,0 +1,90 @@
+import assert from "node:assert/strict";
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import test from "node:test";
+
+import {
+  claudeSettingsPath,
+  withClaudeCode1mSuffix,
+  writeClaudeSettings,
+} from "./claude-config.js";
+
+test("withClaudeCode1mSuffix tags only in-band windows", () => {
+  // in band (800K, 1.5M) -> suffix added
+  assert.equal(withClaudeCode1mSuffix("claude-opus-4.8", 936000), "claude-opus-4.8[1m]");
+  // below the low edge -> unchanged
+  assert.equal(withClaudeCode1mSuffix("claude-opus-4.8", 200000), "claude-opus-4.8");
+  // at/above the high edge -> unchanged (future 2M tier gets its own band)
+  assert.equal(withClaudeCode1mSuffix("future-huge", 2_000_000), "future-huge");
+  // no window known -> unchanged
+  assert.equal(withClaudeCode1mSuffix("claude-opus-4.8"), "claude-opus-4.8");
+  // already suffixed -> not doubled
+  assert.equal(withClaudeCode1mSuffix("gpt-5.5[1m]", 936000), "gpt-5.5[1m]");
+});
+
+// Run a body with HOME pointed at a throwaway dir so the real ~/.claude is untouched.
+function withTempHome(body: () => void) {
+  const dir = mkdtempSync(join(tmpdir(), "ai-bridge-home-"));
+  const prev = process.env.HOME;
+  process.env.HOME = dir;
+  try {
+    body();
+  } finally {
+    if (prev === undefined) delete process.env.HOME;
+    else process.env.HOME = prev;
+    rmSync(dir, { recursive: true, force: true });
+  }
+}
+
+test("writeClaudeSettings writes the three keys and the 1m suffix", () => {
+  withTempHome(() => {
+    const path = writeClaudeSettings({
+      baseUrl: "http://127.0.0.1:11500",
+      authToken: "ai-bridge",
+      model: "claude-opus-4.8",
+      maxInputTokens: 936000,
+    });
+    const onDisk = JSON.parse(readFileSync(path, "utf8")) as { env: Record<string, string> };
+    assert.equal(onDisk.env.ANTHROPIC_BASE_URL, "http://127.0.0.1:11500");
+    assert.equal(onDisk.env.ANTHROPIC_AUTH_TOKEN, "ai-bridge");
+    assert.equal(onDisk.env.ANTHROPIC_MODEL, "claude-opus-4.8[1m]");
+    assert.equal(onDisk.env.CLAUDE_CODE_AUTO_COMPACT_WINDOW, "936000");
+  });
+});
+
+test("writeClaudeSettings preserves unrelated top-level and env keys", () => {
+  withTempHome(() => {
+    const path = claudeSettingsPath();
+    // First write creates the file + dir.
+    writeClaudeSettings({
+      baseUrl: "http://x",
+      authToken: "ai-bridge",
+      model: "m",
+      maxInputTokens: 200000,
+    });
+    // Inject foreign keys CC owns, then write again — they must survive.
+    const seeded = JSON.parse(readFileSync(path, "utf8")) as Record<string, unknown> & {
+      env: Record<string, string>;
+    };
+    seeded.permissions = { allow: ["Bash"] };
+    seeded.enabledPlugins = ["foo"];
+    seeded.env.SOME_OTHER_VAR = "keep-me";
+    writeFileSync(path, JSON.stringify(seeded, null, 2));
+
+    writeClaudeSettings({
+      baseUrl: "http://y",
+      authToken: "ai-bridge",
+      model: "claude-opus-4.8",
+      maxInputTokens: 200000,
+    });
+
+    const onDisk = JSON.parse(readFileSync(path, "utf8")) as Record<string, unknown> & {
+      env: Record<string, string>;
+    };
+    assert.deepEqual(onDisk.permissions, { allow: ["Bash"] });
+    assert.deepEqual(onDisk.enabledPlugins, ["foo"]);
+    assert.equal(onDisk.env.SOME_OTHER_VAR, "keep-me");
+    assert.equal(onDisk.env.ANTHROPIC_BASE_URL, "http://y"); // updated
+  });
+});

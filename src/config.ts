@@ -11,7 +11,7 @@ const numericString = (fallback: number) =>
     .pipe(z.number().int().positive());
 
 const EnvSchema = z.object({
-  AI_BRIDGE_PORT: numericString(11434),
+  AI_BRIDGE_PORT: numericString(11500),
   AI_BRIDGE_HOST: z.string().default("127.0.0.1"),
   AI_BRIDGE_LOG_DIR: z.string().default(join(homedir(), ".ai-bridge", "logs")),
   AI_BRIDGE_LOG_LEVEL: z.enum(["debug", "info", "error"]).default("info"),

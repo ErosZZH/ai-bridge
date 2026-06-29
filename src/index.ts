@@ -1,9 +1,84 @@
+import { createInterface } from "node:readline/promises";
+
 import { serve } from "@hono/node-server";
 
-import { getCopilotToken, getGitHubToken } from "./auth/index.js";
+import { getCopilotToken, getGitHubToken, loginWithDeviceFlow } from "./auth/index.js";
+import {
+  AUTH_TOKEN_VALUE,
+  DEFAULT_MODEL,
+  writeClaudeSettings,
+} from "./claude-config.js";
 import { loadConfig } from "./config.js";
+import { getModels, resolveModel } from "./copilot/models.js";
 import { Logger, ensureLogDir, pruneOldLogs } from "./obs/index.js";
 import { createServer } from "./server/index.js";
+
+// `ai-bridge login` runs the interactive GitHub device flow, writes the default
+// model + connection config into ~/.claude/settings.json, and exits without
+// starting the server.
+async function login() {
+  const config = loadConfig();
+  const token = await loginWithDeviceFlow();
+
+  // Resolve the default model against the live catalog to learn its real input
+  // window (drives the [1m] suffix + auto-compact sizing). Best-effort: if the
+  // account's catalog lacks it, still write the id so CC is wired.
+  const info = await resolveModel(DEFAULT_MODEL).catch(() => null);
+  const path = writeClaudeSettings({
+    baseUrl: config.baseUrl,
+    authToken: AUTH_TOKEN_VALUE,
+    model: DEFAULT_MODEL,
+    maxInputTokens: info?.maxPromptTokens || info?.maxContextWindowTokens,
+  });
+
+  console.log(`Signed in as ${token.user}.`);
+  console.log(`Wrote ${path} (model: ${DEFAULT_MODEL}).`);
+  console.log("Run `ai-bridge model` to choose a different model, or start the bridge with no arguments.");
+}
+
+// `ai-bridge model` lists the Copilot catalog and persists the chosen model into
+// ~/.claude/settings.json. Each row shows the display name and the real id used
+// in code.
+async function selectModel() {
+  const config = loadConfig();
+  const models = await getModels();
+  if (models.length === 0) {
+    console.error("No models available. Run `ai-bridge login` first (or check your Copilot access).");
+    process.exit(1);
+  }
+
+  console.log("Available models:");
+  models.forEach((m, i) => {
+    const ctx = m.maxPromptTokens || m.maxContextWindowTokens;
+    const ctxLabel = ctx ? `${Math.round(ctx / 1000)}k ctx` : "ctx unknown";
+    console.log(`  ${String(i + 1).padStart(2)}) ${m.name}  [${m.id}]  (${ctxLabel})`);
+  });
+
+  const rl = createInterface({ input: process.stdin, output: process.stdout });
+  let chosen;
+  try {
+    while (true) {
+      const answer = (await rl.question(`Select a model [1-${models.length}]: `)).trim();
+      const idx = Number(answer) - 1;
+      if (Number.isInteger(idx) && idx >= 0 && idx < models.length) {
+        chosen = models[idx];
+        break;
+      }
+      console.log("Invalid selection, try again.");
+    }
+  } finally {
+    rl.close();
+  }
+
+  const path = writeClaudeSettings({
+    baseUrl: config.baseUrl,
+    authToken: AUTH_TOKEN_VALUE,
+    model: chosen.id,
+    maxInputTokens: chosen.maxPromptTokens || chosen.maxContextWindowTokens,
+  });
+  console.log(`Selected ${chosen.name} (${chosen.id}).`);
+  console.log(`Wrote ${path}. Restart Claude Code for the change to take effect.`);
+}
 
 async function main() {
   const config = loadConfig();
@@ -22,7 +97,7 @@ async function main() {
     }
   } else {
     logger.info(
-      "no GitHub Copilot credentials found; sign in via VS Code Copilot or `gh copilot`, then restart",
+      "no GitHub Copilot credentials found; run `ai-bridge login` to sign in",
     );
   }
 
@@ -31,13 +106,15 @@ async function main() {
   serve({ fetch: app.fetch, hostname: config.host, port: config.port }, () => {
     logger.info(`listening on ${config.baseUrl}`);
     logger.info(`logs: ${config.logDir}`);
-    logger.info("point Claude Code here:");
-    logger.info(`  export ANTHROPIC_BASE_URL=${config.baseUrl}`);
-    logger.info("  export ANTHROPIC_AUTH_TOKEN=ai-bridge");
+    logger.info("Claude Code config lives in ~/.claude/settings.json");
+    logger.info("  run `ai-bridge login` to wire it, or `ai-bridge model` to change model");
   });
 }
 
-main().catch((err) => {
+const command = process.argv[2];
+const run = command === "login" ? login : command === "model" ? selectModel : main;
+
+run().catch((err) => {
   console.error("[ai-bridge] fatal:", err);
   process.exit(1);
 });

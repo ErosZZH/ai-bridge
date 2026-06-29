@@ -133,12 +133,15 @@ export async function getModels(): Promise<ModelInfo[]> {
   return inflight;
 }
 
-// Resolve a requested id to a catalog model. `auto` lets Copilot pick — pass it
-// through unchanged. Anything else must match exactly; no fuzzy fallback.
+// Resolve a requested id to a catalog model. A trailing `[1m]` is Claude Code's
+// 1M-context marker (added when we write ANTHROPIC_MODEL), not part of the
+// Copilot id — strip it before matching. `auto` lets Copilot pick; pass it
+// through. Anything else must match exactly; no fuzzy fallback.
 export async function resolveModel(requested: string): Promise<ModelInfo | null> {
-  if (requested === "auto") return null;
+  const id = requested.replace(/\[1m\]$/, "");
+  if (id === "auto") return null;
   const models = await getModels();
-  return models.find((m) => m.id === requested) ?? null;
+  return models.find((m) => m.id === id) ?? null;
 }
 
 export function __resetModelsCache() {

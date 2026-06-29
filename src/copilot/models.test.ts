@@ -101,6 +101,14 @@ test("resolveModel matches exact id, no fuzzy fallback", async () => {
   assert.equal(await resolveModel("claude-opus"), null); // close but not exact -> null
 });
 
+test("resolveModel strips Claude Code's [1m] suffix before matching", async () => {
+  authOk();
+  __resetModelsCache();
+  __setModelsDeps({ fetch: async () => json({ data: [CHAT] }), now: () => 0 });
+  // CC writes ANTHROPIC_MODEL with [1m]; the bare id is what the catalog carries.
+  assert.equal((await resolveModel("claude-opus-4.8[1m]"))?.id, "claude-opus-4.8");
+});
+
 test("resolveModel passes 'auto' through", async () => {
   authOk();
   __resetModelsCache();

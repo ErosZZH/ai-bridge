@@ -1,17 +1,22 @@
-// Phase 1: Copilot auth. The GitHub oauth_token is reused from the creds
-// already on disk (apps.json/hosts.json, written by VS Code / copilot.vim).
-// Task 3: exchange that oauth_token at copilot_internal/v2/token for a
-// short-lived Copilot bearer, cache it, refresh before expiry, and on 401
-// re-read the disk token + prompt the user to re-sign-in.
+// Copilot auth. The GitHub oauth_token is read from creds already on disk
+// (apps.json/hosts.json, written by VS Code / copilot.vim / `gh`, or by our own
+// `ai-bridge login` device flow). That token is exchanged at
+// copilot_internal/v2/token for a short-lived Copilot bearer, cached, refreshed
+// before expiry, and re-read from disk on a 401. The device flow itself lives in
+// ./device.ts; this module orchestrates it and persists the result.
 
-import { existsSync, readFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { homedir, platform } from "node:os";
 import { join } from "node:path";
 
-export type DeviceCodePrompt = {
-  userCode: string;
-  verificationUri: string;
-};
+import {
+  COPILOT_CLIENT_ID,
+  fetchGitHubUser,
+  pollForToken,
+  realSleep,
+  requestDeviceCode,
+  type Sleep,
+} from "./device.js";
 
 export type GitHubToken = {
   token: string;
@@ -126,11 +131,22 @@ function nowSeconds(): number {
 }
 
 // Test seam: swap fetch + disk-read so the cache/refresh/401 logic is unit-testable.
+// deviceFetch + sleep are separate so the device-flow polling loop can be driven
+// without real network or wall-clock delays.
 let fetchImpl: typeof fetch = fetch;
 let readTokens: () => GitHubToken[] = readGitHubTokens;
-export function __setAuthDeps(deps: { fetch?: typeof fetch; readTokens?: () => GitHubToken[] }) {
+let deviceFetchImpl: typeof fetch = fetch;
+let sleepImpl: Sleep = realSleep;
+export function __setAuthDeps(deps: {
+  fetch?: typeof fetch;
+  readTokens?: () => GitHubToken[];
+  deviceFetch?: typeof fetch;
+  sleep?: Sleep;
+}) {
   if (deps.fetch) fetchImpl = deps.fetch;
   if (deps.readTokens) readTokens = deps.readTokens;
+  if (deps.deviceFetch) deviceFetchImpl = deps.deviceFetch;
+  if (deps.sleep) sleepImpl = deps.sleep;
   cached = undefined;
   copilot = null;
   inflight = null;
@@ -218,7 +234,53 @@ export async function reauthCopilotToken(): Promise<CopilotToken> {
   return getCopilotToken();
 }
 
-export async function ensureAuth(): Promise<DeviceCodePrompt | null> {
-  getGitHubToken();
-  return null;
+// Persist a freshly-minted oauth_token to apps.json in the shape readGitHubTokens
+// consumes. Preserves any keys already in the file (VS Code / gh creds) and
+// writes 0600 since the file holds a credential. Returns the path written.
+export function writeGitHubToken(oauthToken: string, user: string): string {
+  const dir = findCopilotConfigDirs()[0];
+  if (!dir) throw new CopilotAuthError("no writable github-copilot config dir");
+  const path = join(dir, "apps.json");
+
+  let obj: Record<string, unknown> = {};
+  if (existsSync(path)) {
+    try {
+      const parsed = JSON.parse(readFileSync(path, "utf8"));
+      if (parsed && typeof parsed === "object") obj = parsed as Record<string, unknown>;
+    } catch {
+      // malformed existing file — overwrite rather than fail the login
+    }
+  }
+
+  obj[`github.com:${COPILOT_CLIENT_ID}`] = {
+    githubAppId: COPILOT_CLIENT_ID,
+    oauth_token: oauthToken,
+    user,
+  };
+
+  mkdirSync(dir, { recursive: true });
+  writeFileSync(path, `${JSON.stringify(obj, null, 2)}\n`, { mode: 0o600 });
+  return path;
+}
+
+// Run the full device flow: get a code, show it to the user, poll until they
+// authorize, resolve their username, persist the token, and drop the in-memory
+// cache so the next getCopilotToken() picks it up. Returns the stored token.
+export async function loginWithDeviceFlow(): Promise<GitHubToken> {
+  const code = await requestDeviceCode(deviceFetchImpl);
+
+  // User-facing prompt — direct to stdout, not the logger. The user_code is not
+  // a secret and this is interactive UX, not a log event.
+  console.log("");
+  console.log("To authorize ai-bridge with GitHub Copilot:");
+  console.log(`  1. Open ${code.verificationUri}`);
+  console.log(`  2. Enter the code: ${code.userCode}`);
+  console.log("");
+  console.log("Waiting for authorization...");
+
+  const oauthToken = await pollForToken(deviceFetchImpl, sleepImpl, code);
+  const user = await fetchGitHubUser(deviceFetchImpl, oauthToken);
+  writeGitHubToken(oauthToken, user);
+  refreshGitHubToken();
+  return { token: oauthToken, user };
 }
