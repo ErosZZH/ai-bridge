@@ -28,6 +28,15 @@ export type AnthropicTool = {
   cache_control?: CacheControl;
 };
 
+// auto/any/none all four map cleanly; named tool keeps its name. agent-maestro
+// collapsed any+tool to Required (losing the name) and none to undefined=auto
+// (anthropic.ts:304) because the LM API had no fields for them. OpenAI does.
+export type AnthropicToolChoice =
+  | { type: "auto" }
+  | { type: "any" }
+  | { type: "tool"; name: string }
+  | { type: "none" };
+
 // A user-turn block carries either prior tool output (tool_result) or text.
 // tool_use ids must pair with the tool_result that answered them. thinking/
 // redacted land in 6f. Other fields kept opaque.
@@ -105,6 +114,14 @@ export type OpenAISystemMessage = {
   content: string | OpenAITextPart[];
 };
 
+// "auto" | "required" | "none" | a named function. Mirrors the four Anthropic
+// modes 1:1, so no information is dropped.
+export type OpenAIToolChoice =
+  | "auto"
+  | "required"
+  | "none"
+  | { type: "function"; function: { name: string } };
+
 // One OpenAI system message from the Anthropic system prompt, NOT a User
 // message. A bare string stays a string; blocks become text parts so each
 // block's cache_control survives (6b). Undefined/empty -> no message at all.
@@ -145,6 +162,23 @@ export function mapTools(tools?: AnthropicTool[]): OpenAITool[] | undefined {
       ...withCache(t),
     },
   }));
+}
+
+// 6e: forward the caller's intent verbatim. any->required, none->"none" (vs
+// maestro dropping none to auto), tool->the named function (vs maestro losing
+// the name to bare Required). Undefined choice -> undefined: let Copilot default.
+export function mapToolChoice(choice?: AnthropicToolChoice): OpenAIToolChoice | undefined {
+  if (!choice) return undefined;
+  switch (choice.type) {
+    case "auto":
+      return "auto";
+    case "any":
+      return "required";
+    case "none":
+      return "none";
+    case "tool":
+      return { type: "function", function: { name: choice.name } };
+  }
 }
 
 // 6c: messages. One Anthropic message can fan out to several OpenAI ones —

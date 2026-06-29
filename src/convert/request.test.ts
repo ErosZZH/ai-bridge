@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
-import { mapMessages, mapSystem, mapTools } from "./request.js";
+import { mapMessages, mapSystem, mapToolChoice, mapTools } from "./request.js";
 
 test("string system -> one system message, not user", () => {
   const m = mapSystem("be brief");
@@ -54,6 +54,17 @@ test("no tools -> undefined, no cache_control key when absent", () => {
   assert.equal(mapTools([]), undefined);
   const out = mapTools([{ name: "t", input_schema: {} }]);
   assert.ok(out && !("cache_control" in out[0].function));
+});
+
+test("tool_choice named/any/none/auto each preserved, not collapsed", () => {
+  assert.deepEqual(mapToolChoice({ type: "tool", name: "search" }), {
+    type: "function",
+    function: { name: "search" },
+  });
+  assert.equal(mapToolChoice({ type: "any" }), "required");
+  assert.equal(mapToolChoice({ type: "none" }), "none");
+  assert.equal(mapToolChoice({ type: "auto" }), "auto");
+  assert.equal(mapToolChoice(), undefined);
 });
 
 test("string content -> message kept as plain string, not coerced", () => {
