@@ -29,8 +29,8 @@ export type AnthropicTool = {
 };
 
 // A user-turn block carries either prior tool output (tool_result) or text.
-// tool_use ids must pair with the tool_result that answered them. Image/document
-// blocks land in 6d; thinking/redacted in 6f. Other fields kept opaque.
+// tool_use ids must pair with the tool_result that answered them. thinking/
+// redacted land in 6f. Other fields kept opaque.
 export type AnthropicTextBlock = { type: "text"; text: string; cache_control?: CacheControl };
 export type AnthropicToolUseBlock = {
   type: "tool_use";
@@ -43,10 +43,19 @@ export type AnthropicToolResultBlock = {
   tool_use_id: string;
   content?: string | { type: "text"; text: string }[];
 };
+// base64 (data + media_type) or a url. Documents share the same shape; both
+// are forwarded, neither is JSON-stringified or skipped.
+export type AnthropicSource =
+  | { type: "base64"; media_type: string; data: string }
+  | { type: "url"; url: string };
+export type AnthropicImageBlock = { type: "image"; source: AnthropicSource };
+export type AnthropicDocumentBlock = { type: "document"; source: AnthropicSource };
 export type AnthropicContentBlock =
   | AnthropicTextBlock
   | AnthropicToolUseBlock
-  | AnthropicToolResultBlock;
+  | AnthropicToolResultBlock
+  | AnthropicImageBlock
+  | AnthropicDocumentBlock;
 
 export type AnthropicMessage = {
   role: "user" | "assistant";
@@ -61,6 +70,13 @@ export type OpenAITextPart = {
   cache_control?: CacheControl;
 };
 
+export type OpenAIImagePart = {
+  type: "image_url";
+  image_url: { url: string };
+};
+
+export type OpenAIContentPart = OpenAITextPart | OpenAIImagePart;
+
 export type OpenAIToolCall = {
   id: string;
   type: "function";
@@ -69,7 +85,7 @@ export type OpenAIToolCall = {
 
 export type OpenAIMessage = {
   role: "system" | "user" | "assistant" | "tool";
-  content: string | null;
+  content: string | OpenAIContentPart[] | null;
   tool_calls?: OpenAIToolCall[];
   tool_call_id?: string;
 };
@@ -147,12 +163,15 @@ export function mapMessages(messages: AnthropicMessage[]): OpenAIMessage[] {
     }
 
     const text: string[] = [];
+    const media: OpenAIImagePart[] = []; // images + documents, kept not skipped
     const toolCalls: OpenAIToolCall[] = [];
     const trailing: OpenAIMessage[] = []; // tool messages emit after the parent
 
     for (const block of msg.content) {
       if (block.type === "text") {
         text.push(block.text);
+      } else if (block.type === "image" || block.type === "document") {
+        media.push({ type: "image_url", image_url: { url: sourceUrl(block.source) } });
       } else if (block.type === "tool_use") {
         toolCalls.push({
           id: block.id,
@@ -168,7 +187,15 @@ export function mapMessages(messages: AnthropicMessage[]): OpenAIMessage[] {
       }
     }
 
-    const content = text.length ? text.join("\n") : null;
+    // Text-only turns stay a plain string; once any image/document is present
+    // the message is OpenAI multipart with text parts ahead of media. null only
+    // when there is nothing but tool_calls.
+    let content: string | OpenAIContentPart[] | null;
+    if (media.length) {
+      content = [...text.map((t) => ({ type: "text" as const, text: t })), ...media];
+    } else {
+      content = text.length ? text.join("\n") : null;
+    }
     if (content !== null || toolCalls.length) {
       out.push({ role: msg.role, content, ...(toolCalls.length ? { tool_calls: toolCalls } : {}) });
     }
@@ -176,6 +203,15 @@ export function mapMessages(messages: AnthropicMessage[]): OpenAIMessage[] {
   }
 
   return out;
+}
+
+// base64 -> inline data: URL; url -> verbatim. agent-maestro JSON-stringified
+// url images (anthropic.ts:15) and skipped documents (123); both are real
+// content and forwarded as-is.
+function sourceUrl(source: AnthropicSource): string {
+  return source.type === "url"
+    ? source.url
+    : `data:${source.media_type};base64,${source.data}`;
 }
 
 function toolResultText(content: AnthropicToolResultBlock["content"]): string {

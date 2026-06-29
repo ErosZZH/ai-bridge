@@ -107,3 +107,38 @@ test("text-only tool_use turn -> assistant content null, no empty message droppe
     { role: "assistant", content: null, tool_calls: [{ id: "c1", type: "function", function: { name: "f", arguments: "{}" } }] },
   ]);
 });
+
+test("image base64 -> data: URL, url -> passthrough; text kept as parts", () => {
+  const out = mapMessages([
+    {
+      role: "user",
+      content: [
+        { type: "text", text: "see" },
+        { type: "image", source: { type: "base64", media_type: "image/png", data: "AAAA" } },
+        { type: "image", source: { type: "url", url: "https://x/y.png" } },
+      ],
+    },
+  ]);
+  assert.deepEqual(out, [
+    {
+      role: "user",
+      content: [
+        { type: "text", text: "see" },
+        { type: "image_url", image_url: { url: "data:image/png;base64,AAAA" } },
+        { type: "image_url", image_url: { url: "https://x/y.png" } },
+      ],
+    },
+  ]);
+});
+
+test("document blocks included, not skipped", () => {
+  const out = mapMessages([
+    {
+      role: "user",
+      content: [{ type: "document", source: { type: "base64", media_type: "application/pdf", data: "JVBE" } }],
+    },
+  ]);
+  assert.deepEqual(out, [
+    { role: "user", content: [{ type: "image_url", image_url: { url: "data:application/pdf;base64,JVBE" } }] },
+  ]);
+});
