@@ -2,6 +2,8 @@ import { Hono } from "hono";
 
 import type { Config } from "../config.js";
 import type { Logger } from "../obs/index.js";
+import { registerMessageRoutes } from "./routes/messages.js";
+import { registerModelRoutes } from "./routes/models.js";
 
 export function createServer(config: Config, logger: Logger): Hono {
   const app = new Hono();
@@ -12,6 +14,9 @@ export function createServer(config: Config, logger: Logger): Hono {
   });
 
   app.get("/health", (c) => c.json({ status: "ok", baseUrl: config.baseUrl }));
+
+  registerModelRoutes(app, logger);
+  registerMessageRoutes(app, logger);
 
   return app;
 }
