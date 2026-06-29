@@ -7,8 +7,10 @@
 import type { Context } from "hono";
 
 import { type ModelInfo, getModels } from "../../copilot/models.js";
-import type { Logger } from "../../obs/index.js";
+import type { RequestVars } from "../index.js";
 import { anthropicError } from "../errors.js";
+
+type Ctx = Context<{ Variables: RequestVars }>;
 
 const UNKNOWN_CREATED_AT = "1970-01-01T00:00:00Z";
 
@@ -50,25 +52,24 @@ function toList(models: ModelInfo[]): AnthropicModelsList {
   };
 }
 
-export function registerModelRoutes(
-  app: { get: (path: string, handler: (c: Context) => Promise<Response>) => unknown },
-  logger: Logger,
-): void {
-  app.get("/v1/models", (c) => listModels(c, logger));
-  app.get("/v1/models/:model_id", (c) => getModel(c, logger));
+export function registerModelRoutes(app: {
+  get: (path: string, handler: (c: Ctx) => Promise<Response>) => unknown;
+}): void {
+  app.get("/v1/models", (c) => listModels(c));
+  app.get("/v1/models/:model_id", (c) => getModel(c));
 }
 
-async function listModels(c: Context, logger: Logger): Promise<Response> {
+async function listModels(c: Ctx): Promise<Response> {
   try {
     const models = await getModels();
-    logger.debug(`/v1/models -> ${models.length} models`);
+    c.get("logger").debug("/v1/models", { count: models.length });
     return c.json(toList(models));
   } catch (err) {
-    return modelError(c, err, logger);
+    return modelError(c, err);
   }
 }
 
-async function getModel(c: Context, logger: Logger): Promise<Response> {
+async function getModel(c: Ctx): Promise<Response> {
   const id = c.req.param("model_id");
   try {
     const models = await getModels();
@@ -78,12 +79,12 @@ async function getModel(c: Context, logger: Logger): Promise<Response> {
     }
     return c.json(toAnthropicModel(model));
   } catch (err) {
-    return modelError(c, err, logger);
+    return modelError(c, err);
   }
 }
 
-function modelError(c: Context, err: unknown, logger: Logger): Response {
+function modelError(c: Ctx, err: unknown): Response {
   const message = err instanceof Error ? err.message : String(err);
-  logger.error(`/v1/models failed: ${message}`);
+  c.get("logger").error("/v1/models failed", { message });
   return c.json(anthropicError("api_error", message), 500);
 }

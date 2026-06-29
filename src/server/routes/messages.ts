@@ -31,9 +31,21 @@ import {
 } from "../../copilot/index.js";
 import { responsesCompletion, streamResponsesCompletion } from "../../copilot/responses.js";
 import { type ModelInfo, resolveModel } from "../../copilot/models.js";
-import type { Logger } from "../../obs/index.js";
+import { writeCapture } from "../../obs/capture.js";
+import type { RequestVars } from "../index.js";
 import { type AnthropicErrorType, anthropicError, isContextLengthError } from "../errors.js";
 import { countInputTokens } from "../tokens.js";
+
+type Ctx = Context<{ Variables: RequestVars }>;
+
+// What each error path needs to write a capture file and a tagged error body:
+// the request id, where to write, the inbound + mapped bodies, and the model.
+type ErrorScope = {
+  endpoint: string;
+  model?: string;
+  request?: unknown;
+  upstreamRequest?: unknown;
+};
 
 // Floor used only for `auto`/unknown ids, where no catalog max_output_tokens is
 // known. Catalog-backed models get their own per-model ceiling (info.maxOutputTokens).
@@ -60,12 +72,11 @@ function parseBody(raw: unknown): InboundRequest {
   return raw as InboundRequest;
 }
 
-export function registerMessageRoutes(
-  app: { post: (path: string, handler: (c: Context) => Promise<Response>) => unknown },
-  logger: Logger,
-): void {
-  app.post("/v1/messages", (c) => handleMessages(c, logger));
-  app.post("/v1/messages/count_tokens", (c) => handleCountTokens(c, logger));
+export function registerMessageRoutes(app: {
+  post: (path: string, handler: (c: Ctx) => Promise<Response>) => unknown;
+}): void {
+  app.post("/v1/messages", (c) => handleMessages(c));
+  app.post("/v1/messages/count_tokens", (c) => handleCountTokens(c));
 }
 
 // Default the output cap to "as much as possible" for this model when the client
@@ -78,7 +89,8 @@ function withDefaultBudget(body: InboundRequest, info: ModelInfo | null): Inboun
   return { ...body, max_tokens: fallback };
 }
 
-async function handleMessages(c: Context, logger: Logger): Promise<Response> {
+async function handleMessages(c: Ctx): Promise<Response> {
+  const logger = c.get("logger");
   let raw: InboundRequest;
   try {
     raw = parseBody(await c.req.json());
@@ -93,50 +105,62 @@ async function handleMessages(c: Context, logger: Logger): Promise<Response> {
 
   const body = withDefaultBudget(raw, info);
   const signal = c.req.raw.signal;
+  const scope: ErrorScope = { endpoint: "/v1/messages", model: body.model, request: raw };
 
   // Newest OpenAI models are reachable only via the Responses API; everything
   // else (and `auto`) takes the chat/completions path.
   if (info?.endpoint === "responses") {
+    const req = mapRequestToResponses(body);
+    scope.upstreamRequest = req;
     return body.stream
-      ? streamResponsesMessages(c, mapRequestToResponses(body), body.model, signal, logger)
-      : completeResponses(c, mapRequestToResponses(body), body.model, signal, logger);
+      ? streamResponsesMessages(c, req, body.model, signal, scope)
+      : completeResponses(c, req, body.model, signal, scope);
   }
 
   const openai = mapRequest(body);
+  scope.upstreamRequest = openai;
   if (body.stream) {
-    return streamMessages(c, openai, body.model, signal, logger);
+    return streamMessages(c, openai, body.model, signal, scope);
   }
 
   try {
     const res = (await chatCompletion(openai, signal)) as unknown as OpenAIResponse;
     const mapped = mapResponse(res);
-    logger.info(
-      `/v1/messages ${body.model} in=${mapped.usage.input_tokens} out=${mapped.usage.output_tokens} cache_read=${mapped.usage.cache_read_input_tokens}`,
-    );
+    logger.info("/v1/messages", {
+      model: body.model,
+      in: mapped.usage.input_tokens,
+      out: mapped.usage.output_tokens,
+      cache_read: mapped.usage.cache_read_input_tokens,
+      status: 200,
+    });
     return c.json(mapped);
   } catch (err) {
-    return errorResponse(c, err, logger);
+    return errorResponse(c, err, scope);
   }
 }
 
 // Non-stream Responses path: call /responses, map the output[] body back to an
 // Anthropic Message. Errors classify the same way as the chat path.
 async function completeResponses(
-  c: Context,
+  c: Ctx,
   req: ResponsesRequest,
   model: string,
   signal: AbortSignal,
-  logger: Logger,
+  scope: ErrorScope,
 ): Promise<Response> {
   try {
     const res = (await responsesCompletion(req, signal)) as ResponsesResponse;
     const mapped = mapResponsesResponse(res);
-    logger.info(
-      `/v1/messages ${model} (responses) in=${mapped.usage.input_tokens} out=${mapped.usage.output_tokens} cache_read=${mapped.usage.cache_read_input_tokens}`,
-    );
+    c.get("logger").info("/v1/messages (responses)", {
+      model,
+      in: mapped.usage.input_tokens,
+      out: mapped.usage.output_tokens,
+      cache_read: mapped.usage.cache_read_input_tokens,
+      status: 200,
+    });
     return c.json(mapped);
   } catch (err) {
-    return errorResponse(c, err, logger);
+    return errorResponse(c, err, scope);
   }
 }
 
@@ -146,12 +170,13 @@ async function completeResponses(
 // so a client disconnect tears down the upstream stream; we also stop quietly if
 // the signal trips mid-iteration.
 function streamMessages(
-  c: Context,
+  c: Ctx,
   openai: OpenAIRequest,
   model: string,
   signal: AbortSignal,
-  logger: Logger,
+  scope: ErrorScope,
 ): Response {
+  const logger = c.get("logger");
   return streamSSE(
     c,
     async (sse) => {
@@ -161,15 +186,15 @@ function streamMessages(
           if (signal.aborted) break;
           await sse.writeSSE({ event: event.type, data: JSON.stringify(event) });
         }
-        logger.info(`/v1/messages (stream) ${model} done`);
+        logger.info("/v1/messages (stream) done", { model, status: 200 });
       } catch (err) {
         if (signal.aborted) return; // client went away — nothing to report
-        await writeErrorEvent(sse, err, model, logger);
+        await writeErrorEvent(c, sse, err, scope);
       }
     },
     async (err, sse) => {
       if (signal.aborted) return;
-      await writeErrorEvent(sse, err, model, logger);
+      await writeErrorEvent(c, sse, err, scope);
     },
   );
 }
@@ -178,12 +203,13 @@ function streamMessages(
 // streamResponsesResponse turns them into the same Anthropic SSE lifecycle the
 // harness consumes. Abort handling matches the chat stream.
 function streamResponsesMessages(
-  c: Context,
+  c: Ctx,
   req: ResponsesRequest,
   model: string,
   signal: AbortSignal,
-  logger: Logger,
+  scope: ErrorScope,
 ): Response {
+  const logger = c.get("logger");
   return streamSSE(
     c,
     async (sse) => {
@@ -193,33 +219,40 @@ function streamResponsesMessages(
           if (signal.aborted) break;
           await sse.writeSSE({ event: event.type, data: JSON.stringify(event) });
         }
-        logger.info(`/v1/messages (stream) ${model} (responses) done`);
+        logger.info("/v1/messages (stream, responses) done", { model, status: 200 });
       } catch (err) {
         if (signal.aborted) return;
-        await writeErrorEvent(sse, err, model, logger);
+        await writeErrorEvent(c, sse, err, scope);
       }
     },
     async (err, sse) => {
       if (signal.aborted) return;
-      await writeErrorEvent(sse, err, model, logger);
+      await writeErrorEvent(c, sse, err, scope);
     },
   );
 }
 
 // Mid-stream failures can't change the HTTP status (headers are already sent),
-// so we surface them as an SSE `error` event, which the harness recognizes.
+// so we surface them as an SSE `error` event, which the harness recognizes. We
+// still write a capture file and fold its path + the request id into the error
+// body, so a streamed failure is just as diagnosable as a non-streamed one.
 async function writeErrorEvent(
+  c: Ctx,
   sse: { writeSSE: (m: { event: string; data: string }) => Promise<void> },
   err: unknown,
-  model: string,
-  logger: Logger,
+  scope: ErrorScope,
 ): Promise<void> {
   const { type, message } = classify(err);
-  logger.error(`/v1/messages (stream) ${model} failed: ${message}`);
-  await sse.writeSSE({ event: "error", data: JSON.stringify(anthropicError(type, message)) });
+  const logFile = capture(c, err, scope);
+  c.get("logger").error("/v1/messages (stream) failed", { message, log_file: logFile });
+  await sse.writeSSE({
+    event: "error",
+    data: JSON.stringify(errorBody(c, type, message, logFile)),
+  });
 }
 
-async function handleCountTokens(c: Context, logger: Logger): Promise<Response> {
+async function handleCountTokens(c: Ctx): Promise<Response> {
+  const logger = c.get("logger");
   let body: InboundRequest;
   try {
     body = parseBody(await c.req.json());
@@ -234,17 +267,50 @@ async function handleCountTokens(c: Context, logger: Logger): Promise<Response> 
 
   const openai = mapRequest(body);
   const input_tokens = await countInputTokens(openai, info?.vendor ?? "", body.model);
-  logger.debug(`/v1/messages/count_tokens ${body.model} -> ${input_tokens}`);
+  logger.debug("/v1/messages/count_tokens", { model: body.model, input_tokens });
   return c.json({ input_tokens });
 }
 
-// Map a thrown error to its Anthropic type + HTTP status. Context-length is
-// checked first (Defect A3: off the real status), then auth, then any other
-// Copilot HTTP error keeps its status, and everything else is a 500.
-function errorResponse(c: Context, err: unknown, logger: Logger): Response {
+// Write the per-error capture file for this request and return its path (or
+// undefined if the write failed). Pulls the request id + log dir + retention cap
+// off the request context, so every error path captures identically.
+function capture(c: Ctx, err: unknown, scope: ErrorScope): string | undefined {
+  const config = c.get("config");
+  const upstream = err instanceof CopilotRequestError ? err : undefined;
+  return writeCapture({
+    requestId: c.get("requestId"),
+    dir: config.logDir,
+    maxFiles: config.logMaxFiles,
+    endpoint: scope.endpoint,
+    model: scope.model,
+    request: scope.request,
+    upstreamRequest: scope.upstreamRequest,
+    upstreamStatus: upstream?.status,
+    upstreamBody: upstream?.body,
+    error: err,
+  });
+}
+
+// Anthropic error envelope plus the two observability fields the harness reads
+// from `error`: `request_id` (so the user can quote it) and `log_file` (the
+// capture path). agent-maestro nested `log_file` here too; we add the id.
+function errorBody(c: Ctx, type: AnthropicErrorType, message: string, logFile?: string) {
+  const body = anthropicError(type, message);
+  return {
+    ...body,
+    error: { ...body.error, request_id: c.get("requestId"), log_file: logFile },
+  };
+}
+
+// Map a thrown error to its Anthropic type + HTTP status, write the capture file,
+// and return the tagged error body. Context-length is checked first (Defect A3:
+// off the real status), then auth, then any other Copilot HTTP error keeps its
+// status, and everything else is a 500.
+function errorResponse(c: Ctx, err: unknown, scope: ErrorScope): Response {
   const { type, message, status } = classify(err);
-  logger.error(`/v1/messages failed (${status}): ${message}`);
-  return c.json(anthropicError(type, message), status as 400 | 401 | 404 | 500);
+  const logFile = capture(c, err, scope);
+  c.get("logger").error("/v1/messages failed", { status, message, log_file: logFile });
+  return c.json(errorBody(c, type, message, logFile), status as 400 | 401 | 404 | 500);
 }
 
 function classify(err: unknown): {

@@ -2,13 +2,14 @@ import { serve } from "@hono/node-server";
 
 import { getCopilotToken, getGitHubToken } from "./auth/index.js";
 import { loadConfig } from "./config.js";
-import { Logger, ensureLogDir } from "./obs/index.js";
+import { Logger, ensureLogDir, pruneOldLogs } from "./obs/index.js";
 import { createServer } from "./server/index.js";
 
 async function main() {
   const config = loadConfig();
   ensureLogDir(config.logDir);
-  const logger = new Logger(config.logLevel);
+  pruneOldLogs(config.logDir, "-bridge.log", config.logMaxFiles);
+  const logger = new Logger({ level: config.logLevel, dir: config.logDir });
 
   const auth = getGitHubToken();
   if (auth) {

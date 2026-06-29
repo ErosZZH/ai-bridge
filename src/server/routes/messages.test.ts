@@ -1,5 +1,8 @@
 import assert from "node:assert/strict";
 import test from "node:test";
+import { mkdtempSync, readFileSync, readdirSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 
 import { __setAuthDeps } from "../../auth/index.js";
 import { __setCopilotDeps } from "../../copilot/index.js";
@@ -11,6 +14,13 @@ import { Logger } from "../../obs/index.js";
 import { createServer } from "../index.js";
 
 __setResponseDeps({ id: () => "msg_test" });
+
+// Error-path tests write capture files; isolate them in a temp dir instead of the
+// real ~/.ai-bridge/logs.
+const TEST_LOG_DIR = mkdtempSync(join(tmpdir(), "ai-bridge-test-"));
+function testConfig() {
+  return loadConfig({ AI_BRIDGE_LOG_DIR: TEST_LOG_DIR });
+}
 
 const FAR_FUTURE = Math.floor(Date.now() / 1000) + 3600;
 
@@ -59,7 +69,7 @@ function app(chatFetch: typeof fetch) {
   __resetModelsCache();
   __setModelsDeps({ fetch: async () => json({ data: [GPT, RESP] }), now: () => 0 });
   __setCopilotDeps({ fetch: chatFetch });
-  return createServer(loadConfig({}), new Logger("error"));
+  return createServer(testConfig(), new Logger("error"));
 }
 
 // Like `app` but also stubs the /responses upstream. Returns the server plus a
@@ -71,7 +81,7 @@ function appWithResponses(respFetch: typeof fetch) {
   __setModelsDeps({ fetch: async () => json({ data: [GPT, RESP] }), now: () => 0 });
   __setCopilotDeps({ fetch: async () => json({}, 200) });
   __setResponsesDeps({ fetch: respFetch });
-  return createServer(loadConfig({}), new Logger("error"));
+  return createServer(testConfig(), new Logger("error"));
 }
 
 function post(server: ReturnType<typeof createServer>, path: string, body: unknown): Promise<Response> {
@@ -286,4 +296,54 @@ test("chat model still gets a default budget when max_tokens omitted", async () 
   await post(server, "/v1/messages", { model: "gpt-4o", messages: [{ role: "user", content: "hi" }] });
   // gpt-4o has no max_output_tokens in its stubbed limits -> floor (32000).
   assert.equal((sentBody as unknown as { max_tokens: number }).max_tokens, 32000);
+});
+
+test("every response carries an x-request-id header (observability)", async () => {
+  const server = app(async () =>
+    json({
+      id: "cc-1",
+      model: "gpt-4o",
+      choices: [{ index: 0, message: { role: "assistant", content: "ok" }, finish_reason: "stop" }],
+      usage: { prompt_tokens: 1, completion_tokens: 1, total_tokens: 2 },
+    }),
+  );
+  const res = await post(server, "/v1/messages", {
+    model: "gpt-4o",
+    max_tokens: 8,
+    messages: [{ role: "user", content: "hi" }],
+  });
+  assert.match(res.headers.get("x-request-id") ?? "", /^[a-z0-9]+-[0-9a-f]{8}$/);
+});
+
+test("an errored request returns request_id + log_file and writes the capture", async () => {
+  const before = readdirSync(TEST_LOG_DIR).length;
+  const server = app(async () =>
+    new Response(JSON.stringify({ error: { message: "prompt is too long: 250000 > context window" } }), {
+      status: 400,
+      headers: { "content-type": "application/json" },
+    }),
+  );
+  const res = await post(server, "/v1/messages", {
+    model: "gpt-4o",
+    messages: [{ role: "user", content: "hi" }],
+  });
+  assert.equal(res.status, 400);
+
+  const headerId = res.headers.get("x-request-id");
+  const body = (await res.json()) as {
+    error: { type: string; request_id: string; log_file: string };
+  };
+  // The id in the body matches the header, so a user can quote either.
+  assert.equal(body.error.request_id, headerId);
+  assert.ok(body.error.log_file, "expected a log_file path in the error body");
+
+  // The capture file actually exists, is named with the id, and holds the
+  // upstream status — the real exchange agent-maestro could not see.
+  const after = readdirSync(TEST_LOG_DIR);
+  assert.equal(after.length, before + 1);
+  assert.ok(body.error.log_file.includes(headerId as string));
+  const dump = JSON.parse(readFileSync(body.error.log_file, "utf8"));
+  assert.equal(dump.requestId, headerId);
+  assert.equal(dump.upstream.status, 400);
+  assert.equal(dump.endpoint, "/v1/messages");
 });
