@@ -28,12 +28,50 @@ export type AnthropicTool = {
   cache_control?: CacheControl;
 };
 
+// A user-turn block carries either prior tool output (tool_result) or text.
+// tool_use ids must pair with the tool_result that answered them. Image/document
+// blocks land in 6d; thinking/redacted in 6f. Other fields kept opaque.
+export type AnthropicTextBlock = { type: "text"; text: string; cache_control?: CacheControl };
+export type AnthropicToolUseBlock = {
+  type: "tool_use";
+  id: string;
+  name: string;
+  input: unknown;
+};
+export type AnthropicToolResultBlock = {
+  type: "tool_result";
+  tool_use_id: string;
+  content?: string | { type: "text"; text: string }[];
+};
+export type AnthropicContentBlock =
+  | AnthropicTextBlock
+  | AnthropicToolUseBlock
+  | AnthropicToolResultBlock;
+
+export type AnthropicMessage = {
+  role: "user" | "assistant";
+  content: string | AnthropicContentBlock[];
+};
+
 // --- OpenAI output (subset we emit) ---
 
 export type OpenAITextPart = {
   type: "text";
   text: string;
   cache_control?: CacheControl;
+};
+
+export type OpenAIToolCall = {
+  id: string;
+  type: "function";
+  function: { name: string; arguments: string };
+};
+
+export type OpenAIMessage = {
+  role: "system" | "user" | "assistant" | "tool";
+  content: string | null;
+  tool_calls?: OpenAIToolCall[];
+  tool_call_id?: string;
 };
 
 export type OpenAITool = {
@@ -91,4 +129,57 @@ export function mapTools(tools?: AnthropicTool[]): OpenAITool[] | undefined {
       ...withCache(t),
     },
   }));
+}
+
+// 6c: messages. One Anthropic message can fan out to several OpenAI ones —
+// assistant tool_use blocks become a tool_calls array on the assistant message,
+// while each user tool_result becomes its own `tool` message keyed by the
+// tool_use_id it answers (OpenAI has no multi-result message). agent-maestro
+// flattened the same 1->N way; the difference here is the OpenAI shape and that
+// we keep tool_use/tool_result ids paired rather than coercing both to text.
+export function mapMessages(messages: AnthropicMessage[]): OpenAIMessage[] {
+  const out: OpenAIMessage[] = [];
+
+  for (const msg of messages) {
+    if (typeof msg.content === "string") {
+      out.push({ role: msg.role, content: msg.content });
+      continue;
+    }
+
+    const text: string[] = [];
+    const toolCalls: OpenAIToolCall[] = [];
+    const trailing: OpenAIMessage[] = []; // tool messages emit after the parent
+
+    for (const block of msg.content) {
+      if (block.type === "text") {
+        text.push(block.text);
+      } else if (block.type === "tool_use") {
+        toolCalls.push({
+          id: block.id,
+          type: "function",
+          function: { name: block.name, arguments: JSON.stringify(block.input ?? {}) },
+        });
+      } else if (block.type === "tool_result") {
+        trailing.push({
+          role: "tool",
+          tool_call_id: block.tool_use_id,
+          content: toolResultText(block.content),
+        });
+      }
+    }
+
+    const content = text.length ? text.join("\n") : null;
+    if (content !== null || toolCalls.length) {
+      out.push({ role: msg.role, content, ...(toolCalls.length ? { tool_calls: toolCalls } : {}) });
+    }
+    out.push(...trailing);
+  }
+
+  return out;
+}
+
+function toolResultText(content: AnthropicToolResultBlock["content"]): string {
+  if (!content) return "";
+  if (typeof content === "string") return content;
+  return content.map((c) => c.text).join("\n");
 }
