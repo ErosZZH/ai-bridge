@@ -1,3 +1,3 @@
-// Phase 3: Anthropic <-> OpenAI request/response/stream mappers.
-// See Backlog tasks 6-7. Stubbed for the scaffold.
-export {};
+// Phase 3: Anthropic <-> OpenAI request/response/stream mappers (Backlog 6-7).
+export * from "./request.js";
+export * from "./response.js";
