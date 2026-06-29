@@ -27,9 +27,12 @@ export type CopilotToken = {
 const APPS_FILES = ["apps.json", "hosts.json"];
 const TOKEN_URL = "https://api.github.com/copilot_internal/v2/token";
 const DEFAULT_API = "https://api.githubcopilot.com";
-const EDITOR_VERSION = "vscode/1.96.0";
-const EDITOR_PLUGIN_VERSION = "copilot-chat/0.23.0";
-const USER_AGENT = "GitHubCopilotChat/0.23.0";
+
+// Editor identity sent to both the token exchange and chat/completions; Copilot
+// rejects requests without it. Shared so the client and auth stay in lockstep.
+export const EDITOR_VERSION = "vscode/1.96.0";
+export const EDITOR_PLUGIN_VERSION = "copilot-chat/0.23.0";
+export const USER_AGENT = "GitHubCopilotChat/0.23.0";
 // Re-exchange this many seconds before expiry so an in-flight request never
 // races the clock.
 const REFRESH_SKEW_SECONDS = 120;
