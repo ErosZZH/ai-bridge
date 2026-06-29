@@ -1,6 +1,6 @@
 import { serve } from "@hono/node-server";
 
-import { getGitHubToken } from "./auth/index.js";
+import { getCopilotToken, getGitHubToken } from "./auth/index.js";
 import { loadConfig } from "./config.js";
 import { Logger, ensureLogDir } from "./obs/index.js";
 import { createServer } from "./server/index.js";
@@ -13,6 +13,12 @@ async function main() {
   const auth = getGitHubToken();
   if (auth) {
     logger.info(`using GitHub Copilot credentials for ${auth.user}`);
+    try {
+      const token = await getCopilotToken();
+      logger.info(`Copilot session valid until ${new Date(token.expiresAt * 1000).toISOString()}`);
+    } catch (err) {
+      logger.error(`Copilot token exchange failed: ${(err as Error).message}`);
+    }
   } else {
     logger.info(
       "no GitHub Copilot credentials found; sign in via VS Code Copilot or `gh copilot`, then restart",
