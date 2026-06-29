@@ -33,9 +33,45 @@ $DistEntry = Join-Path $RepoDir 'dist\index.js'
 $TaskName  = 'ai-bridge'
 $BinDir    = Join-Path $env:LOCALAPPDATA 'ai-bridge\bin'
 $Wrapper   = Join-Path $BinDir 'ai-bridge.cmd'
+$ServiceLauncher = Join-Path $BinDir 'ai-bridge-service.cmd'
 
 function Write-Info { param([string]$Msg) Write-Host "==> $Msg" -ForegroundColor Cyan }
 function Write-Warn { param([string]$Msg) Write-Host "warning: $Msg" -ForegroundColor Yellow }
+
+# --- proxy detection ---------------------------------------------------------
+# The scheduled task runs in a logon session that does NOT inherit the proxy you
+# have exported interactively. On some networks GitHub Copilot only serves
+# certain models (e.g. Claude) when traffic exits through a proxy, so a missing
+# proxy silently strips those models from the catalog. Detect the proxy now and
+# bake it into the service env. Override with $env:AI_BRIDGE_PROXY=... ; disable
+# with $env:AI_BRIDGE_PROXY='none'.
+$ProxyUrl   = ''
+$NoProxyVal = ''
+function Invoke-DetectProxy {
+    if ($env:AI_BRIDGE_PROXY -eq 'none') {
+        Write-Info "proxy detection disabled (AI_BRIDGE_PROXY=none)"
+        return
+    }
+
+    # Windows env vars are case-insensitive, so HTTPS_PROXY covers https_proxy.
+    $url = $env:AI_BRIDGE_PROXY
+    if (-not $url) { $url = $env:HTTPS_PROXY }
+    if (-not $url) { $url = $env:HTTP_PROXY }
+    $script:ProxyUrl = $url
+
+    if ($env:NO_PROXY) {
+        $script:NoProxyVal = $env:NO_PROXY
+    } else {
+        $script:NoProxyVal = 'localhost,127.0.0.0/8,::1'
+    }
+
+    if ($script:ProxyUrl) {
+        Write-Info "detected proxy $($script:ProxyUrl) — baking it into the service env"
+    } else {
+        Write-Info "no proxy detected in env; service will connect directly"
+        Write-Warn "if Copilot withholds models (e.g. Claude) without a proxy, re-run with:`n    `$env:AI_BRIDGE_PROXY='http://host:port'; .\install.ps1"
+    }
+}
 
 # =============================================================================
 # uninstall
@@ -52,6 +88,11 @@ function Invoke-Uninstall {
     if (Test-Path $Wrapper) {
         Remove-Item $Wrapper -Force
         Write-Info "removed CLI wrapper $Wrapper"
+    }
+
+    if (Test-Path $ServiceLauncher) {
+        Remove-Item $ServiceLauncher -Force
+        Write-Info "removed service launcher $ServiceLauncher"
     }
 
     # Drop our bin dir from the user PATH.
@@ -128,13 +169,42 @@ function Install-Wrapper {
 }
 
 # =============================================================================
+# Service launcher (.cmd) — sets env (incl. proxy) then runs the bridge
+# =============================================================================
+# Task Scheduler has no per-task environment setting (unlike systemd's
+# `Environment=` or launchd's `EnvironmentVariables`), so we bake the env into a
+# small launcher .cmd and point the task at that.
+function Install-ServiceLauncher {
+    param([string]$NodeBin)
+
+    New-Item -ItemType Directory -Force -Path $BinDir | Out-Null
+
+    $proxyLines = ''
+    if ($ProxyUrl) {
+        $proxyLines = @"
+set "HTTPS_PROXY=$ProxyUrl"
+set "HTTP_PROXY=$ProxyUrl"
+set "NO_PROXY=$NoProxyVal"
+"@
+    }
+
+    $cmd = @"
+@echo off
+set "NODE_ENV=production"
+$proxyLines
+"$NodeBin" "$DistEntry" %*
+"@
+    # ASCII, no BOM — cmd.exe chokes on a UTF-8 BOM at the top of a .cmd.
+    [System.IO.File]::WriteAllText($ServiceLauncher, $cmd, [System.Text.Encoding]::ASCII)
+    Write-Info "installed service launcher at $ServiceLauncher"
+}
+
+# =============================================================================
 # Scheduled Task (logon trigger, restart on failure, user session)
 # =============================================================================
 function Install-Task {
-    param([string]$NodeBin)
-
-    $action = New-ScheduledTaskAction -Execute $NodeBin `
-        -Argument "`"$DistEntry`"" -WorkingDirectory $RepoDir
+    $action = New-ScheduledTaskAction -Execute $ServiceLauncher `
+        -WorkingDirectory $RepoDir
     $trigger = New-ScheduledTaskTrigger -AtLogOn
     $settings = New-ScheduledTaskSettingsSet `
         -AllowStartIfOnBatteries `
@@ -163,8 +233,10 @@ if ($Uninstall) {
 
 $nodeBin = Invoke-Preflight
 Invoke-Build
-Install-Wrapper -NodeBin $nodeBin
-Install-Task   -NodeBin $nodeBin
+Invoke-DetectProxy
+Install-Wrapper          -NodeBin $nodeBin
+Install-ServiceLauncher  -NodeBin $nodeBin
+Install-Task
 
 Write-Host ""
 Write-Info "ai-bridge installed and running at http://127.0.0.1:11500"
