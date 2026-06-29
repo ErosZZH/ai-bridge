@@ -89,6 +89,15 @@ function withDefaultBudget(body: InboundRequest, info: ModelInfo | null): Inboun
   return { ...body, max_tokens: fallback };
 }
 
+// Replace the requested model id with the resolved catalog id before the body is
+// mapped and forwarded upstream. resolveModel matches `claude-opus-4.8[1m]` to the
+// `claude-opus-4.8` catalog entry, but Copilot rejects the suffixed string — so we
+// swap in info.id. When info is null (the `auto` passthrough) the body is unchanged.
+function withResolvedModel(body: InboundRequest, info: ModelInfo | null): InboundRequest {
+  if (!info || body.model === info.id) return body;
+  return { ...body, model: info.id };
+}
+
 async function handleMessages(c: Ctx): Promise<Response> {
   const logger = c.get("logger");
   let raw: InboundRequest;
@@ -103,7 +112,12 @@ async function handleMessages(c: Ctx): Promise<Response> {
     return c.json(anthropicError("not_found_error", `model '${raw.model}' not found`), 404);
   }
 
-  const body = withDefaultBudget(raw, info);
+  // Forward the resolved catalog id upstream, not the requested string. The
+  // requested id may carry Claude Code's `[1m]` marker (e.g. `claude-opus-4.8[1m]`),
+  // which resolveModel strips to match the catalog — but Copilot only knows the
+  // bare id, so sending the suffixed form makes it return an error-shaped body
+  // that crashes the response mapper. `auto` has no catalog entry; pass it through.
+  const body = withResolvedModel(withDefaultBudget(raw, info), info);
   const signal = c.req.raw.signal;
   const scope: ErrorScope = { endpoint: "/v1/messages", model: body.model, request: raw };
 
@@ -265,9 +279,10 @@ async function handleCountTokens(c: Ctx): Promise<Response> {
     return c.json(anthropicError("not_found_error", `model '${body.model}' not found`), 404);
   }
 
-  const openai = mapRequest(body);
-  const input_tokens = await countInputTokens(openai, info?.vendor ?? "", body.model);
-  logger.debug("/v1/messages/count_tokens", { model: body.model, input_tokens });
+  const resolved = withResolvedModel(body, info);
+  const openai = mapRequest(resolved);
+  const input_tokens = await countInputTokens(openai, info?.vendor ?? "", resolved.model);
+  logger.debug("/v1/messages/count_tokens", { model: resolved.model, input_tokens });
   return c.json({ input_tokens });
 }
 

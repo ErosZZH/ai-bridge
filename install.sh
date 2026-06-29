@@ -40,6 +40,32 @@ info()  { printf '\033[1;34m==>\033[0m %s\n' "$*"; }
 warn()  { printf '\033[1;33mwarning:\033[0m %s\n' "$*" >&2; }
 die()   { printf '\033[1;31merror:\033[0m %s\n' "$*" >&2; exit 1; }
 
+# --- proxy detection ---------------------------------------------------------
+# The service runs without a login shell, so it does NOT inherit the proxy you
+# have exported interactively. On some networks GitHub Copilot only serves
+# certain models (e.g. Claude) when traffic exits through a proxy, so a missing
+# proxy silently strips those models from the catalog. Detect the proxy now and
+# bake it into the unit. Override with AI_BRIDGE_PROXY=... ; disable with
+# AI_BRIDGE_PROXY=none.
+PROXY_URL=""
+NO_PROXY_VAL=""
+detect_proxy() {
+  if [ "${AI_BRIDGE_PROXY:-}" = "none" ]; then
+    info "proxy detection disabled (AI_BRIDGE_PROXY=none)"
+    return
+  fi
+  PROXY_URL="${AI_BRIDGE_PROXY:-${HTTPS_PROXY:-${https_proxy:-${HTTP_PROXY:-${http_proxy:-}}}}}"
+  NO_PROXY_VAL="${NO_PROXY:-${no_proxy:-localhost,127.0.0.0/8,::1}}"
+
+  if [ -n "$PROXY_URL" ]; then
+    info "detected proxy $PROXY_URL — baking it into the service env"
+  else
+    info "no proxy detected in env; service will connect directly"
+    warn "if Copilot withholds models (e.g. Claude) without a proxy, re-run with:
+    AI_BRIDGE_PROXY=http://host:port ./install.sh"
+  fi
+}
+
 # =============================================================================
 # uninstall
 # =============================================================================
@@ -124,6 +150,14 @@ install_systemd() {
   local node_bin="$1"
   command -v systemctl >/dev/null 2>&1 || die "systemctl not found; this Linux install path requires systemd."
 
+  # Proxy lines in systemd `Environment=` form, or empty when no proxy is in use.
+  local proxy_env=""
+  if [ -n "$PROXY_URL" ]; then
+    proxy_env="Environment=HTTPS_PROXY=$PROXY_URL
+Environment=HTTP_PROXY=$PROXY_URL
+Environment=NO_PROXY=$NO_PROXY_VAL"
+  fi
+
   mkdir -p "$UNIT_DIR"
   cat >"$UNIT_FILE" <<EOF
 [Unit]
@@ -136,6 +170,7 @@ Type=simple
 ExecStart=$node_bin $DIST_ENTRY
 WorkingDirectory=$REPO_DIR
 Environment=NODE_ENV=production
+$proxy_env
 Restart=on-failure
 RestartSec=3
 
@@ -166,6 +201,18 @@ EOF
 install_launchd() {
   local node_bin="$1"
   mkdir -p "$HOME/Library/LaunchAgents" "$LOG_DIR"
+
+  # Proxy entries as plist <key>/<string> pairs, or empty when no proxy is in use.
+  local proxy_env=""
+  if [ -n "$PROXY_URL" ]; then
+    proxy_env="        <key>HTTPS_PROXY</key>
+        <string>$PROXY_URL</string>
+        <key>HTTP_PROXY</key>
+        <string>$PROXY_URL</string>
+        <key>NO_PROXY</key>
+        <string>$NO_PROXY_VAL</string>"
+  fi
+
   cat >"$PLIST_FILE" <<EOF
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -184,6 +231,7 @@ install_launchd() {
     <dict>
         <key>NODE_ENV</key>
         <string>production</string>
+$proxy_env
     </dict>
     <key>RunAtLoad</key>
     <true/>
@@ -214,6 +262,7 @@ main() {
 
   preflight
   build
+  detect_proxy
 
   local node_bin
   node_bin="$(command -v node)"

@@ -78,6 +78,14 @@ test("GET /v1/models/:id returns one model", async () => {
   assert.equal(body.max_input_tokens, 136000);
 });
 
+test("GET /v1/models/:id strips Claude Code's [1m] suffix before matching", async () => {
+  const server = app(async () => json({ data: [CHAT_A, CHAT_B] }));
+  const res = await server.request("/v1/models/claude-opus-4.8%5B1m%5D");
+  assert.equal(res.status, 200);
+  const body = (await res.json()) as { id: string };
+  assert.equal(body.id, "claude-opus-4.8");
+});
+
 test("GET /v1/models/:id 404s an unknown id", async () => {
   const server = app(async () => json({ data: [CHAT_A] }));
   const res = await server.request("/v1/models/nope");

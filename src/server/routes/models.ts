@@ -6,7 +6,7 @@
 
 import type { Context } from "hono";
 
-import { type ModelInfo, getModels } from "../../copilot/models.js";
+import { type ModelInfo, getModels, resolveModel } from "../../copilot/models.js";
 import type { RequestVars } from "../index.js";
 import { anthropicError } from "../errors.js";
 
@@ -70,10 +70,13 @@ async function listModels(c: Ctx): Promise<Response> {
 }
 
 async function getModel(c: Ctx): Promise<Response> {
-  const id = c.req.param("model_id");
+  const id = c.req.param("model_id") ?? "";
   try {
-    const models = await getModels();
-    const model = models.find((m) => m.id === id);
+    // resolveModel strips Claude Code's `[1m]` context marker before matching,
+    // so a configured ANTHROPIC_MODEL like `claude-opus-4.8[1m]` resolves to the
+    // bare catalog id instead of 404ing (the harness probes this route at startup
+    // to validate the selected model).
+    const model = await resolveModel(id);
     if (!model) {
       return c.json(anthropicError("not_found_error", `model '${id}' not found`), 404);
     }

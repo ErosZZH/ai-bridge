@@ -62,12 +62,23 @@ const RESP = {
   capabilities: { type: "chat", limits: { max_context_window_tokens: 1050000, max_output_tokens: 128000, max_prompt_tokens: 922000 } },
 };
 
+// A Claude model: the bridge must forward this bare id upstream even when the
+// request carries Claude Code's `[1m]` context marker (claude-opus-4.8[1m]).
+const CLAUDE = {
+  id: "claude-opus-4.8",
+  name: "Claude Opus 4.8",
+  vendor: "Anthropic",
+  object: "model",
+  supported_endpoints: ["/chat/completions"],
+  capabilities: { type: "chat", limits: { max_context_window_tokens: 1000000, max_prompt_tokens: 936000 } },
+};
+
 // Build a server with the model catalog stubbed; `chatFetch` stubs the Copilot
 // chat/completions call (the seam the messages route ultimately drives).
 function app(chatFetch: typeof fetch) {
   authOk();
   __resetModelsCache();
-  __setModelsDeps({ fetch: async () => json({ data: [GPT, RESP] }), now: () => 0 });
+  __setModelsDeps({ fetch: async () => json({ data: [GPT, RESP, CLAUDE] }), now: () => 0 });
   __setCopilotDeps({ fetch: chatFetch });
   return createServer(testConfig(), new Logger("error"));
 }
@@ -484,6 +495,49 @@ test("POST /v1/messages forwards cache_control breakpoints upstream (Defect A1)"
   assert.deepEqual(systemPart.cache_control, { type: "ephemeral" });
   // ...and the tool breakpoint survives on the function. The LM API dropped both.
   assert.deepEqual(body.tools[0].function.cache_control, { type: "ephemeral" });
+});
+
+test("POST /v1/messages forwards the resolved catalog id upstream, stripping [1m]", async () => {
+  // The harness usually strips [1m] before the wire, but when the literal
+  // `claude-opus-4.8[1m]` reaches the bridge it must still send the bare id
+  // upstream — Copilot rejects the suffixed string with an error-shaped body.
+  let sent: { model?: string } | null = null;
+  const server = app(async (_url, init) => {
+    sent = JSON.parse(String(init?.body ?? "{}"));
+    return json({
+      id: "cc-1",
+      model: "claude-opus-4.8",
+      choices: [{ index: 0, message: { role: "assistant", content: "ok" }, finish_reason: "stop" }],
+      usage: { prompt_tokens: 5, completion_tokens: 1, total_tokens: 6 },
+    });
+  });
+
+  const res = await post(server, "/v1/messages", {
+    model: "claude-opus-4.8[1m]",
+    max_tokens: 16,
+    messages: [{ role: "user", content: "hi" }],
+  });
+
+  assert.equal(res.status, 200);
+  assert.ok(sent, "upstream was called");
+  assert.equal((sent as { model: string }).model, "claude-opus-4.8");
+});
+
+test("POST /v1/messages maps an upstream body with no choices to a clean error, not a crash", async () => {
+  // A malformed/error-shaped upstream body (no choices[]) must surface as a
+  // classified API error, not an opaque "Cannot read properties of undefined".
+  const server = app(async () => json({ error: { message: "model unavailable" } }));
+
+  const res = await post(server, "/v1/messages", {
+    model: "claude-opus-4.8",
+    max_tokens: 16,
+    messages: [{ role: "user", content: "hi" }],
+  });
+
+  assert.equal(res.status, 500);
+  const body = (await res.json()) as { error: { type: string; message: string } };
+  assert.equal(body.error.type, "api_error");
+  assert.match(body.error.message, /no choices/);
 });
 
 test("POST /v1/messages surfaces cache_read + cache_creation usage (compaction inputs)", async () => {

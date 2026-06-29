@@ -240,6 +240,15 @@ function parseToolInput(args: string): unknown {
 // an object. stop_reason comes from finish_reason, upgraded to tool_use whenever
 // tool calls are present (OpenAI sometimes reports "stop" alongside tool_calls).
 export function mapResponse(res: OpenAIResponse): AnthropicResponse {
+  // A well-formed chat/completions body always carries a non-empty choices array.
+  // When it doesn't, the upstream returned an error-shaped body (e.g. an unknown
+  // model id slipped through); fail with a clear message instead of crashing on
+  // choices[0] with an opaque "Cannot read properties of undefined" TypeError.
+  if (!Array.isArray(res.choices) || res.choices.length === 0) {
+    throw new Error(
+      `upstream response has no choices (model '${res.model ?? "unknown"}'): ${JSON.stringify(res).slice(0, 500)}`,
+    );
+  }
   const choice = res.choices[0];
   const message = choice?.message;
   const content: AnthropicResponseBlock[] = [];
