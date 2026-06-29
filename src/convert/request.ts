@@ -37,9 +37,9 @@ export type AnthropicToolChoice =
   | { type: "tool"; name: string }
   | { type: "none" };
 
-// A user-turn block carries either prior tool output (tool_result) or text.
-// tool_use ids must pair with the tool_result that answered them. thinking/
-// redacted land in 6f. Other fields kept opaque.
+// A turn block carries text, prior tool output (tool_result), tool calls, media,
+// or the model's reasoning. tool_use ids must pair with the tool_result that
+// answered them. Other fields kept opaque.
 export type AnthropicTextBlock = { type: "text"; text: string; cache_control?: CacheControl };
 export type AnthropicToolUseBlock = {
   type: "tool_use";
@@ -59,16 +59,39 @@ export type AnthropicSource =
   | { type: "url"; url: string };
 export type AnthropicImageBlock = { type: "image"; source: AnthropicSource };
 export type AnthropicDocumentBlock = { type: "document"; source: AnthropicSource };
+// The model's reasoning from a prior assistant turn. agent-maestro flattened
+// these to bare text (anthropic.ts:25-31), discarding the type and the
+// `signature` Anthropic needs to verify replayed thinking. We keep both so the
+// turn round-trips, not just the visible text.
+export type AnthropicThinkingBlock = { type: "thinking"; thinking: string; signature?: string };
+export type AnthropicRedactedThinkingBlock = { type: "redacted_thinking"; data: string };
 export type AnthropicContentBlock =
   | AnthropicTextBlock
   | AnthropicToolUseBlock
   | AnthropicToolResultBlock
   | AnthropicImageBlock
-  | AnthropicDocumentBlock;
+  | AnthropicDocumentBlock
+  | AnthropicThinkingBlock
+  | AnthropicRedactedThinkingBlock;
 
 export type AnthropicMessage = {
   role: "user" | "assistant";
   content: string | AnthropicContentBlock[];
+};
+
+// The scalars 6f forwards verbatim. max_tokens/temperature/top_p pass straight
+// through; stop_sequences renames to OpenAI `stop`. model is required; stream is
+// decided by the route, so it's set there, not here.
+export type AnthropicRequest = {
+  model: string;
+  messages: AnthropicMessage[];
+  system?: AnthropicSystem;
+  tools?: AnthropicTool[];
+  tool_choice?: AnthropicToolChoice;
+  max_tokens?: number;
+  temperature?: number;
+  top_p?: number;
+  stop_sequences?: string[];
 };
 
 // --- OpenAI output (subset we emit) ---
@@ -84,7 +107,24 @@ export type OpenAIImagePart = {
   image_url: { url: string };
 };
 
-export type OpenAIContentPart = OpenAITextPart | OpenAIImagePart;
+// Reasoning preserved as a typed content part rather than collapsed to a text
+// part: the type stays distinct and the signature/redacted data ride along, so
+// the assistant turn replays the same thinking it produced.
+export type OpenAIThinkingPart = {
+  type: "thinking";
+  thinking: string;
+  signature?: string;
+};
+export type OpenAIRedactedThinkingPart = {
+  type: "redacted_thinking";
+  data: string;
+};
+
+export type OpenAIContentPart =
+  | OpenAITextPart
+  | OpenAIImagePart
+  | OpenAIThinkingPart
+  | OpenAIRedactedThinkingPart;
 
 export type OpenAIToolCall = {
   id: string;
@@ -121,6 +161,19 @@ export type OpenAIToolChoice =
   | "required"
   | "none"
   | { type: "function"; function: { name: string } };
+
+// The assembled chat/completions body. stream is added by copilot.chatCompletion
+// / streamChatCompletion, so it isn't part of the mapped body.
+export type OpenAIRequest = {
+  model: string;
+  messages: OpenAIMessage[];
+  tools?: OpenAITool[];
+  tool_choice?: OpenAIToolChoice;
+  max_tokens?: number;
+  temperature?: number;
+  top_p?: number;
+  stop?: string[];
+};
 
 // One OpenAI system message from the Anthropic system prompt, NOT a User
 // message. A bare string stays a string; blocks become text parts so each
@@ -198,6 +251,7 @@ export function mapMessages(messages: AnthropicMessage[]): OpenAIMessage[] {
 
     const text: string[] = [];
     const media: OpenAIImagePart[] = []; // images + documents, kept not skipped
+    const thinking: (OpenAIThinkingPart | OpenAIRedactedThinkingPart)[] = [];
     const toolCalls: OpenAIToolCall[] = [];
     const trailing: OpenAIMessage[] = []; // tool messages emit after the parent
 
@@ -206,6 +260,10 @@ export function mapMessages(messages: AnthropicMessage[]): OpenAIMessage[] {
         text.push(block.text);
       } else if (block.type === "image" || block.type === "document") {
         media.push({ type: "image_url", image_url: { url: sourceUrl(block.source) } });
+      } else if (block.type === "thinking") {
+        thinking.push({ type: "thinking", thinking: block.thinking, ...(block.signature ? { signature: block.signature } : {}) });
+      } else if (block.type === "redacted_thinking") {
+        thinking.push({ type: "redacted_thinking", data: block.data });
       } else if (block.type === "tool_use") {
         toolCalls.push({
           id: block.id,
@@ -221,12 +279,12 @@ export function mapMessages(messages: AnthropicMessage[]): OpenAIMessage[] {
       }
     }
 
-    // Text-only turns stay a plain string; once any image/document is present
-    // the message is OpenAI multipart with text parts ahead of media. null only
+    // Text-only turns stay a plain string. Any thinking/image/document forces
+    // multipart, reasoning first so it precedes the visible answer. null only
     // when there is nothing but tool_calls.
     let content: string | OpenAIContentPart[] | null;
-    if (media.length) {
-      content = [...text.map((t) => ({ type: "text" as const, text: t })), ...media];
+    if (thinking.length || media.length) {
+      content = [...thinking, ...text.map((t) => ({ type: "text" as const, text: t })), ...media];
     } else {
       content = text.length ? text.join("\n") : null;
     }
@@ -252,4 +310,26 @@ function toolResultText(content: AnthropicToolResultBlock["content"]): string {
   if (!content) return "";
   if (typeof content === "string") return content;
   return content.map((c) => c.text).join("\n");
+}
+
+// 6f: assemble the full chat/completions body. system message goes first, then
+// the mapped turns; tools/tool_choice via the 6b/6e mappers; scalars verbatim
+// except stop_sequences -> OpenAI `stop`. Optionals are omitted (not null) when
+// absent so Copilot applies its own defaults. stream is set by the client.
+export function mapRequest(req: AnthropicRequest): OpenAIRequest {
+  const system = mapSystem(req.system);
+  const messages = mapMessages(req.messages);
+  const tools = mapTools(req.tools);
+  const tool_choice = mapToolChoice(req.tool_choice);
+
+  return {
+    model: req.model,
+    messages: system ? [system, ...messages] : messages,
+    ...(tools ? { tools } : {}),
+    ...(tool_choice ? { tool_choice } : {}),
+    ...(req.max_tokens !== undefined ? { max_tokens: req.max_tokens } : {}),
+    ...(req.temperature !== undefined ? { temperature: req.temperature } : {}),
+    ...(req.top_p !== undefined ? { top_p: req.top_p } : {}),
+    ...(req.stop_sequences?.length ? { stop: req.stop_sequences } : {}),
+  };
 }

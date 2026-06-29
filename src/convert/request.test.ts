@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
-import { mapMessages, mapSystem, mapToolChoice, mapTools } from "./request.js";
+import { mapMessages, mapRequest, mapSystem, mapToolChoice, mapTools } from "./request.js";
 
 test("string system -> one system message, not user", () => {
   const m = mapSystem("be brief");
@@ -152,4 +152,49 @@ test("document blocks included, not skipped", () => {
   assert.deepEqual(out, [
     { role: "user", content: [{ type: "image_url", image_url: { url: "data:application/pdf;base64,JVBE" } }] },
   ]);
+});
+
+test("thinking/redacted preserved with signature, reasoning before answer", () => {
+  const out = mapMessages([
+    {
+      role: "assistant",
+      content: [
+        { type: "thinking", thinking: "step", signature: "sig" },
+        { type: "redacted_thinking", data: "ENC" },
+        { type: "text", text: "answer" },
+      ],
+    },
+  ]);
+  assert.deepEqual(out, [
+    {
+      role: "assistant",
+      content: [
+        { type: "thinking", thinking: "step", signature: "sig" },
+        { type: "redacted_thinking", data: "ENC" },
+        { type: "text", text: "answer" },
+      ],
+    },
+  ]);
+});
+
+test("scalars forwarded; stop_sequences->stop; system prepended; absent omitted", () => {
+  const out = mapRequest({
+    model: "gpt-4o",
+    system: "be brief",
+    messages: [{ role: "user", content: "hi" }],
+    max_tokens: 100,
+    temperature: 0.2,
+    stop_sequences: ["END"],
+  });
+  assert.deepEqual(out, {
+    model: "gpt-4o",
+    messages: [
+      { role: "system", content: "be brief" },
+      { role: "user", content: "hi" },
+    ],
+    max_tokens: 100,
+    temperature: 0.2,
+    stop: ["END"],
+  });
+  assert.ok(!("top_p" in out) && !("tools" in out) && !("tool_choice" in out) && !("stream" in out));
 });
