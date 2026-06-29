@@ -38,6 +38,16 @@ const CHAT_B = {
   supported_endpoints: ["/chat/completions"],
   capabilities: { type: "chat", limits: { max_context_window_tokens: 200000, max_prompt_tokens: 136000 } },
 };
+const CHAT_C = {
+  ...CHAT_B,
+  id: "claude-sonnet-4.6",
+  name: "Claude Sonnet 4.6",
+};
+const CHAT_D = {
+  ...CHAT_B,
+  id: "claude-haiku-4.5",
+  name: "Claude Haiku 4.5",
+};
 
 function app(catalogFetch: typeof fetch) {
   authOk();
@@ -84,6 +94,18 @@ test("GET /v1/models/:id strips Claude Code's [1m] suffix before matching", asyn
   assert.equal(res.status, 200);
   const body = (await res.json()) as { id: string };
   assert.equal(body.id, "claude-opus-4.8");
+});
+
+test("GET /v1/models/:id resolves Anthropic canonical Claude aliases", async () => {
+  const server = app(async () => json({ data: [CHAT_A, CHAT_B, CHAT_C, CHAT_D] }));
+
+  const sonnet = await server.request("/v1/models/claude-sonnet-4-6");
+  assert.equal(sonnet.status, 200);
+  assert.equal(((await sonnet.json()) as { id: string }).id, "claude-sonnet-4.6");
+
+  const haiku = await server.request("/v1/models/claude-haiku-4-5-20251001");
+  assert.equal(haiku.status, 200);
+  assert.equal(((await haiku.json()) as { id: string }).id, "claude-haiku-4.5");
 });
 
 test("GET /v1/models/:id 404s an unknown id", async () => {

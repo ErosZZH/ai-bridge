@@ -133,15 +133,34 @@ export async function getModels(): Promise<ModelInfo[]> {
   return inflight;
 }
 
+const CLAUDE_MODEL_ALIASES: Record<string, string> = {
+  "claude-opus-4-8": "claude-opus-4.8",
+  "claude-opus-4-7": "claude-opus-4.7",
+  "claude-opus-4-6": "claude-opus-4.6",
+  "claude-opus-4-5": "claude-opus-4.5",
+  "claude-sonnet-4-6": "claude-sonnet-4.6",
+  "claude-sonnet-4-5": "claude-sonnet-4.5",
+  "claude-haiku-4-5": "claude-haiku-4.5",
+  "claude-haiku-4-5-20251001": "claude-haiku-4.5",
+};
+
+function modelCandidates(requested: string): string[] {
+  const id = requested.replace(/\[1m\]$/, "");
+  const aliased = CLAUDE_MODEL_ALIASES[id];
+  return aliased && aliased !== id ? [id, aliased] : [id];
+}
+
 // Resolve a requested id to a catalog model. A trailing `[1m]` is Claude Code's
 // 1M-context marker (added when we write ANTHROPIC_MODEL), not part of the
-// Copilot id — strip it before matching. `auto` lets Copilot pick; pass it
-// through. Anything else must match exactly; no fuzzy fallback.
+// Copilot id — strip it before matching. Claude Code may also send Anthropic
+// canonical aliases (`claude-opus-4-8`, dated Haiku ids); Copilot's catalog uses
+// dot-style ids (`claude-opus-4.8`), so try those deterministic aliases after an
+// exact match. `auto` lets Copilot pick; pass it through. No fuzzy fallback.
 export async function resolveModel(requested: string): Promise<ModelInfo | null> {
-  const id = requested.replace(/\[1m\]$/, "");
-  if (id === "auto") return null;
+  const candidates = modelCandidates(requested);
+  if (candidates[0] === "auto") return null;
   const models = await getModels();
-  return models.find((m) => m.id === id) ?? null;
+  return candidates.map((id) => models.find((m) => m.id === id)).find(Boolean) ?? null;
 }
 
 export function __resetModelsCache() {

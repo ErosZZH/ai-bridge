@@ -32,6 +32,16 @@ const CHAT = {
     limits: { max_context_window_tokens: 200000, max_output_tokens: 64000, max_prompt_tokens: 136000 },
   },
 };
+const SONNET = {
+  ...CHAT,
+  id: "claude-sonnet-4.6",
+  name: "Claude Sonnet 4.6",
+};
+const HAIKU = {
+  ...CHAT,
+  id: "claude-haiku-4.5",
+  name: "Claude Haiku 4.5",
+};
 const EMBED = { id: "text-embedding-3-small", object: "model", capabilities: { type: "embeddings" } };
 
 // A /responses-only model (e.g. gpt-5.5): no /chat/completions in its endpoints.
@@ -107,6 +117,18 @@ test("resolveModel strips Claude Code's [1m] suffix before matching", async () =
   __setModelsDeps({ fetch: async () => json({ data: [CHAT] }), now: () => 0 });
   // CC writes ANTHROPIC_MODEL with [1m]; the bare id is what the catalog carries.
   assert.equal((await resolveModel("claude-opus-4.8[1m]"))?.id, "claude-opus-4.8");
+});
+
+test("resolveModel maps Anthropic canonical Claude ids to Copilot catalog ids", async () => {
+  authOk();
+  __resetModelsCache();
+  __setModelsDeps({ fetch: async () => json({ data: [CHAT, SONNET, HAIKU] }), now: () => 0 });
+  assert.equal((await resolveModel("claude-opus-4-8"))?.id, "claude-opus-4.8");
+  assert.equal((await resolveModel("claude-opus-4-8[1m]"))?.id, "claude-opus-4.8");
+  assert.equal((await resolveModel("claude-sonnet-4-6"))?.id, "claude-sonnet-4.6");
+  assert.equal((await resolveModel("claude-haiku-4-5"))?.id, "claude-haiku-4.5");
+  assert.equal((await resolveModel("claude-haiku-4-5-20251001"))?.id, "claude-haiku-4.5");
+  assert.equal(await resolveModel("claude-haiku-4-6"), null);
 });
 
 test("resolveModel passes 'auto' through", async () => {

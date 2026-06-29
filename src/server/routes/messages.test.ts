@@ -72,13 +72,18 @@ const CLAUDE = {
   supported_endpoints: ["/chat/completions"],
   capabilities: { type: "chat", limits: { max_context_window_tokens: 1000000, max_prompt_tokens: 936000 } },
 };
+const CLAUDE_HAIKU = {
+  ...CLAUDE,
+  id: "claude-haiku-4.5",
+  name: "Claude Haiku 4.5",
+};
 
 // Build a server with the model catalog stubbed; `chatFetch` stubs the Copilot
 // chat/completions call (the seam the messages route ultimately drives).
 function app(chatFetch: typeof fetch) {
   authOk();
   __resetModelsCache();
-  __setModelsDeps({ fetch: async () => json({ data: [GPT, RESP, CLAUDE] }), now: () => 0 });
+  __setModelsDeps({ fetch: async () => json({ data: [GPT, RESP, CLAUDE, CLAUDE_HAIKU] }), now: () => 0 });
   __setCopilotDeps({ fetch: chatFetch });
   return createServer(testConfig(), new Logger("error"));
 }
@@ -521,6 +526,56 @@ test("POST /v1/messages forwards the resolved catalog id upstream, stripping [1m
   assert.equal(res.status, 200);
   assert.ok(sent, "upstream was called");
   assert.equal((sent as { model: string }).model, "claude-opus-4.8");
+});
+
+test("POST /v1/messages forwards Anthropic canonical Claude ids as Copilot catalog ids", async () => {
+  let sent: { model?: string } | null = null;
+  const server = app(async (_url, init) => {
+    sent = JSON.parse(String(init?.body ?? "{}"));
+    return json({
+      id: "cc-1",
+      model: "claude-haiku-4.5",
+      choices: [{ index: 0, message: { role: "assistant", content: "ok" }, finish_reason: "stop" }],
+      usage: { prompt_tokens: 5, completion_tokens: 1, total_tokens: 6 },
+    });
+  });
+
+  const res = await post(server, "/v1/messages", {
+    model: "claude-haiku-4-5-20251001",
+    max_tokens: 16,
+    messages: [{ role: "user", content: "hi" }],
+  });
+
+  assert.equal(res.status, 200);
+  assert.ok(sent, "upstream was called");
+  assert.equal((sent as { model: string }).model, "claude-haiku-4.5");
+});
+
+test("POST /v1/messages rejects malformed request shapes as 400", async () => {
+  const server = app(async () => json({}, 200));
+
+  for (const body of [
+    {},
+    { model: "", messages: [{ role: "user", content: "hi" }] },
+    { model: 123, messages: [{ role: "user", content: "hi" }] },
+    { model: "gpt-4o" },
+    { model: "gpt-4o", messages: "hi" },
+  ]) {
+    const res = await post(server, "/v1/messages", body);
+    assert.equal(res.status, 400, JSON.stringify(body));
+    const out = (await res.json()) as { error: { type: string; message: string } };
+    assert.equal(out.error.type, "invalid_request_error");
+    assert.match(out.error.message, /model|messages/);
+  }
+});
+
+test("POST /v1/messages/count_tokens rejects malformed request shapes as 400", async () => {
+  const server = app(async () => json({}, 200));
+  const res = await post(server, "/v1/messages/count_tokens", {});
+  assert.equal(res.status, 400);
+  const body = (await res.json()) as { error: { type: string; message: string } };
+  assert.equal(body.error.type, "invalid_request_error");
+  assert.match(body.error.message, /model/);
 });
 
 test("POST /v1/messages maps an upstream body with no choices to a clean error, not a crash", async () => {

@@ -65,11 +65,23 @@ async function resolve(model: string) {
 // route reads `stream` to choose the path but never forwards it through mapping.
 type InboundRequest = AnthropicRequest & { stream?: boolean };
 
-// Body is forwarded verbatim, exactly as agent-maestro deliberately skipped
-// schema validation so upstream API drift doesn't break the bridge. The convert
-// layer only reads the fields it maps and tolerates extras.
+// Body is forwarded mostly verbatim, exactly as agent-maestro deliberately
+// skipped full schema validation so upstream API drift doesn't break the bridge.
+// We still validate the fields the route itself needs (`model`, `messages`) so
+// empty/malformed requests fail as Anthropic-style 400s instead of crashing or
+// turning into misleading model 404s.
 function parseBody(raw: unknown): InboundRequest {
-  return raw as InboundRequest;
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) {
+    throw new Error("request body must be a JSON object");
+  }
+  const body = raw as Partial<InboundRequest>;
+  if (typeof body.model !== "string" || body.model.trim().length === 0) {
+    throw new Error("model is required and must be a non-empty string");
+  }
+  if (!Array.isArray(body.messages)) {
+    throw new Error("messages is required and must be an array");
+  }
+  return body as InboundRequest;
 }
 
 export function registerMessageRoutes(app: {
@@ -103,11 +115,18 @@ async function handleMessages(c: Ctx): Promise<Response> {
   let raw: InboundRequest;
   try {
     raw = parseBody(await c.req.json());
-  } catch {
-    return c.json(anthropicError("invalid_request_error", "request body is not valid JSON"), 400);
+  } catch (err) {
+    const message = err instanceof Error ? err.message : "request body is not valid JSON";
+    return c.json(anthropicError("invalid_request_error", message), 400);
   }
 
-  const { info, isAuto } = await resolve(raw.model).catch(() => ({ info: null, isAuto: false }));
+  let info: ModelInfo | null;
+  let isAuto: boolean;
+  try {
+    ({ info, isAuto } = await resolve(raw.model));
+  } catch (err) {
+    return errorResponse(c, err, { endpoint: "/v1/messages", model: raw.model, request: raw });
+  }
   if (!info && !isAuto) {
     return c.json(anthropicError("not_found_error", `model '${raw.model}' not found`), 404);
   }
@@ -270,11 +289,18 @@ async function handleCountTokens(c: Ctx): Promise<Response> {
   let body: InboundRequest;
   try {
     body = parseBody(await c.req.json());
-  } catch {
-    return c.json(anthropicError("invalid_request_error", "request body is not valid JSON"), 400);
+  } catch (err) {
+    const message = err instanceof Error ? err.message : "request body is not valid JSON";
+    return c.json(anthropicError("invalid_request_error", message), 400);
   }
 
-  const { info, isAuto } = await resolve(body.model).catch(() => ({ info: null, isAuto: false }));
+  let info: ModelInfo | null;
+  let isAuto: boolean;
+  try {
+    ({ info, isAuto } = await resolve(body.model));
+  } catch (err) {
+    return errorResponse(c, err, { endpoint: "/v1/messages/count_tokens", model: body.model, request: body });
+  }
   if (!info && !isAuto) {
     return c.json(anthropicError("not_found_error", `model '${body.model}' not found`), 404);
   }
