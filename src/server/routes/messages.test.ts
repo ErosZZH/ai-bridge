@@ -3,6 +3,7 @@ import test from "node:test";
 
 import { __setAuthDeps } from "../../auth/index.js";
 import { __setCopilotDeps } from "../../copilot/index.js";
+import { __setResponsesDeps } from "../../copilot/responses.js";
 import { __resetModelsCache, __setModelsDeps } from "../../copilot/models.js";
 import { __setResponseDeps } from "../../convert/index.js";
 import { loadConfig } from "../../config.js";
@@ -40,13 +41,36 @@ const GPT = {
   capabilities: { type: "chat", limits: { max_context_window_tokens: 128000, max_prompt_tokens: 120000 } },
 };
 
+// A /responses-only model, with a catalog max_output_tokens the route should use
+// as the default budget when the client omits max_tokens.
+const RESP = {
+  id: "gpt-5.5",
+  name: "GPT-5.5",
+  vendor: "OpenAI",
+  object: "model",
+  supported_endpoints: ["/responses", "ws:/responses"],
+  capabilities: { type: "chat", limits: { max_context_window_tokens: 1050000, max_output_tokens: 128000, max_prompt_tokens: 922000 } },
+};
+
 // Build a server with the model catalog stubbed; `chatFetch` stubs the Copilot
 // chat/completions call (the seam the messages route ultimately drives).
 function app(chatFetch: typeof fetch) {
   authOk();
   __resetModelsCache();
-  __setModelsDeps({ fetch: async () => json({ data: [GPT] }), now: () => 0 });
+  __setModelsDeps({ fetch: async () => json({ data: [GPT, RESP] }), now: () => 0 });
   __setCopilotDeps({ fetch: chatFetch });
+  return createServer(loadConfig({}), new Logger("error"));
+}
+
+// Like `app` but also stubs the /responses upstream. Returns the server plus a
+// getter for the last body POSTed to /responses, so tests can assert mapping +
+// the injected default budget.
+function appWithResponses(respFetch: typeof fetch) {
+  authOk();
+  __resetModelsCache();
+  __setModelsDeps({ fetch: async () => json({ data: [GPT, RESP] }), now: () => 0 });
+  __setCopilotDeps({ fetch: async () => json({}, 200) });
+  __setResponsesDeps({ fetch: respFetch });
   return createServer(loadConfig({}), new Logger("error"));
 }
 
@@ -180,4 +204,86 @@ test("POST /v1/messages/count_tokens returns a positive input_tokens", async () 
   assert.equal(res.status, 200);
   const body = (await res.json()) as { input_tokens: number };
   assert.ok(body.input_tokens > 0, "expected a positive token count");
+});
+
+test("POST /v1/messages routes a /responses-only model through the Responses path", async () => {
+  let captured: { url: string; body: unknown } | null = null;
+  const server = appWithResponses(async (url, init) => {
+    captured = { url: String(url), body: JSON.parse(String(init?.body ?? "{}")) };
+    return json({
+      id: "resp-1",
+      model: "gpt-5.5-2026-04-23",
+      status: "completed",
+      output: [
+        { type: "reasoning" },
+        { type: "message", role: "assistant", content: [{ type: "output_text", text: "hi from responses" }] },
+      ],
+      usage: { input_tokens: 11, output_tokens: 4, input_tokens_details: { cached_tokens: 0 } },
+    });
+  });
+
+  const res = await post(server, "/v1/messages", {
+    model: "gpt-5.5",
+    messages: [{ role: "user", content: "hi" }],
+  });
+  assert.equal(res.status, 200);
+  const body = (await res.json()) as {
+    content: { type: string; text: string }[];
+    usage: { input_tokens: number; output_tokens: number };
+  };
+  assert.deepEqual(body.content, [{ type: "text", text: "hi from responses" }]);
+  assert.equal(body.usage.input_tokens, 11);
+  assert.equal(body.usage.output_tokens, 4);
+
+  // It hit /responses, NOT /chat/completions, and the per-model catalog
+  // max_output_tokens (128000) was injected as the default budget.
+  assert.ok(captured, "responses upstream was called");
+  assert.match((captured as { url: string }).url, /\/responses$/);
+  const sent = (captured as { body: { max_output_tokens?: number } }).body;
+  assert.equal(sent.max_output_tokens, 128000);
+});
+
+test("POST /v1/messages (responses) stream -> Anthropic SSE lifecycle", async () => {
+  const events = [
+    { type: "response.created", response: { id: "r1" } },
+    { type: "response.output_text.delta", delta: "hel" },
+    { type: "response.output_text.delta", delta: "lo" },
+    { type: "response.completed", response: { status: "completed", usage: { input_tokens: 9, output_tokens: 5 } } },
+  ];
+  const server = appWithResponses(async () => sse(events));
+  const res = await post(server, "/v1/messages", {
+    model: "gpt-5.5",
+    stream: true,
+    messages: [{ role: "user", content: "hi" }],
+  });
+  assert.equal(res.status, 200);
+  const text = await res.text();
+  const seen = [...text.matchAll(/^event: (.+)$/gm)].map((m) => m[1]);
+  assert.deepEqual(seen, [
+    "message_start",
+    "content_block_start",
+    "content_block_delta",
+    "content_block_delta",
+    "content_block_stop",
+    "message_delta",
+    "message_stop",
+  ]);
+  assert.match(text, /"text_delta","text":"hel"/);
+  assert.match(text, /"stop_reason":"end_turn"/);
+});
+
+test("chat model still gets a default budget when max_tokens omitted", async () => {
+  let sentBody: { max_tokens?: number } | null = null;
+  const server = app(async (_url, init) => {
+    sentBody = JSON.parse(String(init?.body ?? "{}"));
+    return json({
+      id: "cc-1",
+      model: "gpt-4o",
+      choices: [{ index: 0, message: { role: "assistant", content: "ok" }, finish_reason: "stop" }],
+      usage: { prompt_tokens: 1, completion_tokens: 1, total_tokens: 2 },
+    });
+  });
+  await post(server, "/v1/messages", { model: "gpt-4o", messages: [{ role: "user", content: "hi" }] });
+  // gpt-4o has no max_output_tokens in its stubbed limits -> floor (32000).
+  assert.equal((sentBody as unknown as { max_tokens: number }).max_tokens, 32000);
 });

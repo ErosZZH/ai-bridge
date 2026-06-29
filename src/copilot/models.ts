@@ -13,6 +13,7 @@ import {
   getCopilotToken,
   reauthCopilotToken,
 } from "../auth/index.js";
+import { curlFetch } from "./curlFetch.js";
 import { CopilotRequestError } from "./index.js";
 
 export const MODELS_TTL_MS = 5 * 60 * 1000;
@@ -24,6 +25,10 @@ export type ModelInfo = {
   maxContextWindowTokens: number;
   maxOutputTokens: number;
   maxPromptTokens: number;
+  // Which upstream surface serves this model. Most go through /chat/completions;
+  // the newest OpenAI models (gpt-5.5, gpt-5.3-codex, gpt-5.4-mini) are only
+  // reachable via /responses. The route picks the path off this.
+  endpoint: "chat" | "responses";
 };
 
 // Raw /models entry, narrowed to the fields we read. Copilot also returns
@@ -45,7 +50,7 @@ type RawModel = {
   };
 };
 
-let fetchImpl: typeof fetch = fetch;
+let fetchImpl: typeof fetch = curlFetch;
 let nowMs: () => number = () => Date.now();
 export function __setModelsDeps(deps: { fetch?: typeof fetch; now?: () => number }) {
   if (deps.fetch) fetchImpl = deps.fetch;
@@ -55,11 +60,25 @@ export function __setModelsDeps(deps: { fetch?: typeof fetch; now?: () => number
 let cache: { at: number; models: ModelInfo[] } | null = null;
 let inflight: Promise<ModelInfo[]> | null = null;
 
+// A model is usable if it serves chat-style turns over EITHER /chat/completions
+// OR /responses (the newest OpenAI models are /responses-only). Embeddings and
+// other non-chat entries lack both endpoints (and carry object/type markers we
+// reject), so they stay filtered out.
 function isChatModel(m: RawModel): boolean {
   if (m.object && m.object !== "model") return false;
   if (m.capabilities?.type && m.capabilities.type !== "chat") return false;
-  if (m.supported_endpoints && !m.supported_endpoints.includes("/chat/completions")) return false;
-  return Boolean(m.id);
+  if (!m.id) return false;
+  const endpoints = m.supported_endpoints;
+  if (!endpoints) return true; // no endpoint list advertised -> assume chat
+  return endpoints.includes("/chat/completions") || endpoints.includes("/responses");
+}
+
+// Prefer /chat/completions when a model supports it (richer, already-mapped
+// path); fall back to /responses for the models that only expose that surface.
+function modelEndpoint(m: RawModel): "chat" | "responses" {
+  const endpoints = m.supported_endpoints;
+  if (!endpoints || endpoints.includes("/chat/completions")) return "chat";
+  return "responses";
 }
 
 function toModelInfo(m: RawModel): ModelInfo {
@@ -71,6 +90,7 @@ function toModelInfo(m: RawModel): ModelInfo {
     maxContextWindowTokens: limits.max_context_window_tokens ?? 0,
     maxOutputTokens: limits.max_output_tokens ?? 0,
     maxPromptTokens: limits.max_prompt_tokens ?? 0,
+    endpoint: modelEndpoint(m),
   };
 }
 

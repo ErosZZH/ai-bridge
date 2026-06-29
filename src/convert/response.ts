@@ -179,6 +179,11 @@ let idImpl: () => string = () => `msg_${cryptoSuffix()}`;
 function cryptoSuffix(): string {
   return globalThis.crypto.randomUUID().replace(/-/g, "");
 }
+// Shared id generator so the /responses mapper emits ids from the same seam
+// (and honors the same test override) as the chat path.
+export function newMessageId(): string {
+  return idImpl();
+}
 export function __setResponseDeps(deps: { id?: () => string }) {
   if (deps.id) idImpl = deps.id;
 }

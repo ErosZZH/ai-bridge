@@ -13,6 +13,7 @@ import {
   getCopilotToken,
   reauthCopilotToken,
 } from "../auth/index.js";
+import { curlFetch } from "./curlFetch.js";
 
 // Exact-as-returned usage. Cache fields are optional — Copilot only sends them
 // when cache_control breakpoints actually hit, but when present they are the
@@ -60,8 +61,10 @@ export class CopilotRequestError extends Error {
 }
 
 // Test seam, mirroring auth/__setAuthDeps. Lets the stream/401 logic be unit
-// tested without disk creds or a live endpoint.
-let fetchImpl: typeof fetch = fetch;
+// tested without disk creds or a live endpoint. Production default is the
+// node-libcurl transport (curlFetch) — undici/native TLS is fingerprint-blocked
+// from Claude by the Copilot edge; see copilot/curlFetch.ts.
+let fetchImpl: typeof fetch = curlFetch;
 export function __setCopilotDeps(deps: { fetch?: typeof fetch }) {
   if (deps.fetch) fetchImpl = deps.fetch;
 }

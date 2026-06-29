@@ -34,6 +34,19 @@ const CHAT = {
 };
 const EMBED = { id: "text-embedding-3-small", object: "model", capabilities: { type: "embeddings" } };
 
+// A /responses-only model (e.g. gpt-5.5): no /chat/completions in its endpoints.
+const RESPONSES_ONLY = {
+  id: "gpt-5.5",
+  name: "GPT-5.5",
+  vendor: "OpenAI",
+  object: "model",
+  supported_endpoints: ["/responses", "ws:/responses"],
+  capabilities: {
+    type: "chat",
+    limits: { max_context_window_tokens: 1050000, max_output_tokens: 128000, max_prompt_tokens: 922000 },
+  },
+};
+
 test("getModels parses windows and drops non-chat entries", async () => {
   authOk();
   __resetModelsCache();
@@ -43,6 +56,21 @@ test("getModels parses windows and drops non-chat entries", async () => {
   assert.equal(models[0].id, "claude-opus-4.8");
   assert.equal(models[0].maxContextWindowTokens, 200000);
   assert.equal(models[0].maxPromptTokens, 136000);
+});
+
+test("getModels tags endpoint: chat for /chat/completions, responses for /responses-only", async () => {
+  authOk();
+  __resetModelsCache();
+  __setModelsDeps({ fetch: async () => json({ data: [CHAT, RESPONSES_ONLY, EMBED] }), now: () => 0 });
+  const models = await getModels();
+  // embeddings still dropped; both chat + responses-only survive
+  assert.deepEqual(
+    models.map((m) => m.id).sort(),
+    ["claude-opus-4.8", "gpt-5.5"],
+  );
+  assert.equal(models.find((m) => m.id === "claude-opus-4.8")?.endpoint, "chat");
+  assert.equal(models.find((m) => m.id === "gpt-5.5")?.endpoint, "responses");
+  assert.equal(models.find((m) => m.id === "gpt-5.5")?.maxOutputTokens, 128000);
 });
 
 test("getModels caches within TTL, refetches after expiry", async () => {

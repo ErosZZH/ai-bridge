@@ -163,13 +163,16 @@ export type OpenAIToolChoice =
   | { type: "function"; function: { name: string } };
 
 // The assembled chat/completions body. stream is added by copilot.chatCompletion
-// / streamChatCompletion, so it isn't part of the mapped body.
+// / streamChatCompletion, so it isn't part of the mapped body. The output cap is
+// emitted under `max_tokens` for most models but `max_completion_tokens` for the
+// GPT-5 series, which rejects the legacy name — see emitMaxTokens.
 export type OpenAIRequest = {
   model: string;
   messages: OpenAIMessage[];
   tools?: OpenAITool[];
   tool_choice?: OpenAIToolChoice;
   max_tokens?: number;
+  max_completion_tokens?: number;
   temperature?: number;
   top_p?: number;
   stop?: string[];
@@ -300,22 +303,36 @@ export function mapMessages(messages: AnthropicMessage[]): OpenAIMessage[] {
 // base64 -> inline data: URL; url -> verbatim. agent-maestro JSON-stringified
 // url images (anthropic.ts:15) and skipped documents (123); both are real
 // content and forwarded as-is.
-function sourceUrl(source: AnthropicSource): string {
+export function sourceUrl(source: AnthropicSource): string {
   return source.type === "url"
     ? source.url
     : `data:${source.media_type};base64,${source.data}`;
 }
 
-function toolResultText(content: AnthropicToolResultBlock["content"]): string {
+export function toolResultText(content: AnthropicToolResultBlock["content"]): string {
   if (!content) return "";
   if (typeof content === "string") return content;
   return content.map((c) => c.text).join("\n");
 }
 
+// The GPT-5 series rejects the legacy `max_tokens` on /chat/completions with
+// "Unsupported parameter ... Use max_completion_tokens instead". Every other
+// family still takes `max_tokens`. Detect GPT-5 by id so the cap lands under the
+// name the model accepts; an unknown/blank value emits nothing (Copilot defaults).
+export function isGpt5(model: string): boolean {
+  return /^gpt-5(\.|-|$)/i.test(model);
+}
+
+function emitMaxTokens(model: string, value?: number): Record<string, number> {
+  if (value === undefined) return {};
+  return isGpt5(model) ? { max_completion_tokens: value } : { max_tokens: value };
+}
+
 // 6f: assemble the full chat/completions body. system message goes first, then
 // the mapped turns; tools/tool_choice via the 6b/6e mappers; scalars verbatim
 // except stop_sequences -> OpenAI `stop`. Optionals are omitted (not null) when
-// absent so Copilot applies its own defaults. stream is set by the client.
+// absent so Copilot applies its own defaults. stream is set by the client. The
+// output cap is emitted under the family-correct key (see emitMaxTokens).
 export function mapRequest(req: AnthropicRequest): OpenAIRequest {
   const system = mapSystem(req.system);
   const messages = mapMessages(req.messages);
@@ -327,7 +344,7 @@ export function mapRequest(req: AnthropicRequest): OpenAIRequest {
     messages: system ? [system, ...messages] : messages,
     ...(tools ? { tools } : {}),
     ...(tool_choice ? { tool_choice } : {}),
-    ...(req.max_tokens !== undefined ? { max_tokens: req.max_tokens } : {}),
+    ...emitMaxTokens(req.model, req.max_tokens),
     ...(req.temperature !== undefined ? { temperature: req.temperature } : {}),
     ...(req.top_p !== undefined ? { top_p: req.top_p } : {}),
     ...(req.stop_sequences?.length ? { stop: req.stop_sequences } : {}),

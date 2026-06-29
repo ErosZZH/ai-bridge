@@ -17,6 +17,11 @@ import {
   streamResponse,
   type OpenAIResponse,
   type OpenAIStreamChunk,
+  type ResponsesRequest,
+  type ResponsesResponse,
+  mapRequestToResponses,
+  mapResponsesResponse,
+  streamResponsesResponse,
 } from "../../convert/index.js";
 import {
   CopilotAuthError,
@@ -24,10 +29,15 @@ import {
   chatCompletion,
   streamChatCompletion,
 } from "../../copilot/index.js";
-import { resolveModel } from "../../copilot/models.js";
+import { responsesCompletion, streamResponsesCompletion } from "../../copilot/responses.js";
+import { type ModelInfo, resolveModel } from "../../copilot/models.js";
 import type { Logger } from "../../obs/index.js";
 import { type AnthropicErrorType, anthropicError, isContextLengthError } from "../errors.js";
 import { countInputTokens } from "../tokens.js";
+
+// Floor used only for `auto`/unknown ids, where no catalog max_output_tokens is
+// known. Catalog-backed models get their own per-model ceiling (info.maxOutputTokens).
+const DEFAULT_MAX_TOKENS_FLOOR = 32000;
 
 // Resolve the requested id to a catalog entry. `auto` is the explicit
 // passthrough sentinel (resolveModel returns null) — we forward `model` as-is
@@ -58,22 +68,41 @@ export function registerMessageRoutes(
   app.post("/v1/messages/count_tokens", (c) => handleCountTokens(c, logger));
 }
 
+// Default the output cap to "as much as possible" for this model when the client
+// omits max_tokens. Gemini/GPT-5 burn output budget on internal reasoning, so a
+// missing/small cap silently truncates the visible answer; the catalog's
+// max_output_tokens is the real ceiling. Returns a body with max_tokens set.
+function withDefaultBudget(body: InboundRequest, info: ModelInfo | null): InboundRequest {
+  if (body.max_tokens !== undefined) return body;
+  const fallback = info?.maxOutputTokens || DEFAULT_MAX_TOKENS_FLOOR;
+  return { ...body, max_tokens: fallback };
+}
+
 async function handleMessages(c: Context, logger: Logger): Promise<Response> {
-  let body: InboundRequest;
+  let raw: InboundRequest;
   try {
-    body = parseBody(await c.req.json());
+    raw = parseBody(await c.req.json());
   } catch {
     return c.json(anthropicError("invalid_request_error", "request body is not valid JSON"), 400);
   }
 
-  const { info, isAuto } = await resolve(body.model).catch(() => ({ info: null, isAuto: false }));
+  const { info, isAuto } = await resolve(raw.model).catch(() => ({ info: null, isAuto: false }));
   if (!info && !isAuto) {
-    return c.json(anthropicError("not_found_error", `model '${body.model}' not found`), 404);
+    return c.json(anthropicError("not_found_error", `model '${raw.model}' not found`), 404);
+  }
+
+  const body = withDefaultBudget(raw, info);
+  const signal = c.req.raw.signal;
+
+  // Newest OpenAI models are reachable only via the Responses API; everything
+  // else (and `auto`) takes the chat/completions path.
+  if (info?.endpoint === "responses") {
+    return body.stream
+      ? streamResponsesMessages(c, mapRequestToResponses(body), body.model, signal, logger)
+      : completeResponses(c, mapRequestToResponses(body), body.model, signal, logger);
   }
 
   const openai = mapRequest(body);
-  const signal = c.req.raw.signal;
-
   if (body.stream) {
     return streamMessages(c, openai, body.model, signal, logger);
   }
@@ -83,6 +112,27 @@ async function handleMessages(c: Context, logger: Logger): Promise<Response> {
     const mapped = mapResponse(res);
     logger.info(
       `/v1/messages ${body.model} in=${mapped.usage.input_tokens} out=${mapped.usage.output_tokens} cache_read=${mapped.usage.cache_read_input_tokens}`,
+    );
+    return c.json(mapped);
+  } catch (err) {
+    return errorResponse(c, err, logger);
+  }
+}
+
+// Non-stream Responses path: call /responses, map the output[] body back to an
+// Anthropic Message. Errors classify the same way as the chat path.
+async function completeResponses(
+  c: Context,
+  req: ResponsesRequest,
+  model: string,
+  signal: AbortSignal,
+  logger: Logger,
+): Promise<Response> {
+  try {
+    const res = (await responsesCompletion(req, signal)) as ResponsesResponse;
+    const mapped = mapResponsesResponse(res);
+    logger.info(
+      `/v1/messages ${model} (responses) in=${mapped.usage.input_tokens} out=${mapped.usage.output_tokens} cache_read=${mapped.usage.cache_read_input_tokens}`,
     );
     return c.json(mapped);
   } catch (err) {
@@ -114,6 +164,38 @@ function streamMessages(
         logger.info(`/v1/messages (stream) ${model} done`);
       } catch (err) {
         if (signal.aborted) return; // client went away — nothing to report
+        await writeErrorEvent(sse, err, model, logger);
+      }
+    },
+    async (err, sse) => {
+      if (signal.aborted) return;
+      await writeErrorEvent(sse, err, model, logger);
+    },
+  );
+}
+
+// Streaming Responses path: the /responses client yields semantic events;
+// streamResponsesResponse turns them into the same Anthropic SSE lifecycle the
+// harness consumes. Abort handling matches the chat stream.
+function streamResponsesMessages(
+  c: Context,
+  req: ResponsesRequest,
+  model: string,
+  signal: AbortSignal,
+  logger: Logger,
+): Response {
+  return streamSSE(
+    c,
+    async (sse) => {
+      const events = streamResponsesCompletion(req, signal);
+      try {
+        for await (const event of streamResponsesResponse(events as never, model)) {
+          if (signal.aborted) break;
+          await sse.writeSSE({ event: event.type, data: JSON.stringify(event) });
+        }
+        logger.info(`/v1/messages (stream) ${model} (responses) done`);
+      } catch (err) {
+        if (signal.aborted) return;
         await writeErrorEvent(sse, err, model, logger);
       }
     },

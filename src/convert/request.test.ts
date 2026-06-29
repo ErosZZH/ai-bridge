@@ -198,3 +198,26 @@ test("scalars forwarded; stop_sequences->stop; system prepended; absent omitted"
   });
   assert.ok(!("top_p" in out) && !("tools" in out) && !("tool_choice" in out) && !("stream" in out));
 });
+
+test("non-GPT5 emits max_tokens", () => {
+  for (const model of ["gpt-4o", "claude-opus-4.8", "gemini-3.5-flash", "gpt-4.1"]) {
+    const out = mapRequest({ model, messages: [{ role: "user", content: "hi" }], max_tokens: 100 });
+    assert.equal(out.max_tokens, 100, model);
+    assert.ok(!("max_completion_tokens" in out), model);
+  }
+});
+
+test("GPT-5 series emits max_completion_tokens, not max_tokens", () => {
+  for (const model of ["gpt-5.5", "gpt-5.4", "gpt-5-mini", "gpt-5.3-codex", "gpt-5"]) {
+    const out = mapRequest({ model, messages: [{ role: "user", content: "hi" }], max_tokens: 100 });
+    assert.equal(out.max_completion_tokens, 100, model);
+    assert.ok(!("max_tokens" in out), model);
+  }
+});
+
+test("absent max_tokens emits neither field", () => {
+  const a = mapRequest({ model: "gpt-5.5", messages: [{ role: "user", content: "hi" }] });
+  assert.ok(!("max_tokens" in a) && !("max_completion_tokens" in a));
+  const b = mapRequest({ model: "gpt-4o", messages: [{ role: "user", content: "hi" }] });
+  assert.ok(!("max_tokens" in b) && !("max_completion_tokens" in b));
+});
