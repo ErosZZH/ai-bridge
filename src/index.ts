@@ -1,6 +1,6 @@
 import { serve } from "@hono/node-server";
 
-import { ensureAuth } from "./auth/index.js";
+import { getGitHubToken } from "./auth/index.js";
 import { loadConfig } from "./config.js";
 import { Logger, ensureLogDir } from "./obs/index.js";
 import { createServer } from "./server/index.js";
@@ -10,10 +10,12 @@ async function main() {
   ensureLogDir(config.logDir);
   const logger = new Logger(config.logLevel);
 
-  const prompt = await ensureAuth();
-  if (prompt) {
+  const auth = getGitHubToken();
+  if (auth) {
+    logger.info(`using GitHub Copilot credentials for ${auth.user}`);
+  } else {
     logger.info(
-      `GitHub auth required: open ${prompt.verificationUri} and enter ${prompt.userCode}`,
+      "no GitHub Copilot credentials found; sign in via VS Code Copilot or `gh copilot`, then restart",
     );
   }
 
