@@ -31,7 +31,11 @@ export function __setResponsesDeps(deps: { fetch?: typeof fetch }) {
   if (deps.fetch) fetchImpl = deps.fetch;
 }
 
-async function send(body: Record<string, unknown>, stream: boolean): Promise<Response> {
+async function send(
+  body: Record<string, unknown>,
+  stream: boolean,
+  signal?: AbortSignal,
+): Promise<Response> {
   const attempt = async (token: { token: string; endpoint: string }) =>
     fetchImpl(`${token.endpoint}/responses`, {
       method: "POST",
@@ -45,6 +49,7 @@ async function send(body: Record<string, unknown>, stream: boolean): Promise<Res
         "User-Agent": USER_AGENT,
       },
       body: JSON.stringify({ ...body, stream }),
+      signal,
     });
 
   let res = await attempt(await getCopilotToken());
@@ -64,9 +69,9 @@ async function send(body: Record<string, unknown>, stream: boolean): Promise<Res
 
 export async function responsesCompletion(
   body: Record<string, unknown>,
-  _signal?: AbortSignal,
+  signal?: AbortSignal,
 ): Promise<unknown> {
-  const res = await send(body, false);
+  const res = await send(body, false, signal);
   return res.json();
 }
 
@@ -76,9 +81,9 @@ export async function responsesCompletion(
 // edge ever sends one — ends the stream.
 export async function* streamResponsesCompletion(
   body: Record<string, unknown>,
-  _signal?: AbortSignal,
+  signal?: AbortSignal,
 ): AsyncGenerator<ResponsesStreamEvent> {
-  const res = await send(body, true);
+  const res = await send(body, true, signal);
   if (!res.body) throw new CopilotRequestError("stream response had no body", res.status, "");
 
   const reader = res.body.getReader();

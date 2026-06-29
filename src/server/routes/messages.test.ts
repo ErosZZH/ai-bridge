@@ -5,7 +5,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 import { __setAuthDeps } from "../../auth/index.js";
-import { __setCopilotDeps } from "../../copilot/index.js";
+import { __setCopilotDeps, chatCompletion } from "../../copilot/index.js";
 import { __setResponsesDeps } from "../../copilot/responses.js";
 import { __resetModelsCache, __setModelsDeps } from "../../copilot/models.js";
 import { __setResponseDeps } from "../../convert/index.js";
@@ -346,4 +346,201 @@ test("an errored request returns request_id + log_file and writes the capture", 
   assert.equal(dump.requestId, headerId);
   assert.equal(dump.upstream.status, 400);
   assert.equal(dump.endpoint, "/v1/messages");
+});
+
+// --- Task 10: tools / cache / compaction / abort (integration vs the route) ---
+
+test("POST /v1/messages (tools) forwards OpenAI tools+tool_choice and maps tool_calls -> tool_use", async () => {
+  let sent: { tools?: unknown; tool_choice?: unknown } | null = null;
+  const server = app(async (_url, init) => {
+    sent = JSON.parse(String(init?.body ?? "{}"));
+    return json({
+      id: "cc-1",
+      model: "gpt-4o",
+      choices: [
+        {
+          index: 0,
+          message: {
+            role: "assistant",
+            content: null,
+            tool_calls: [
+              { id: "call_1", type: "function", function: { name: "get_weather", arguments: '{"city":"SF"}' } },
+            ],
+          },
+          finish_reason: "tool_calls",
+        },
+      ],
+      usage: { prompt_tokens: 30, completion_tokens: 8, total_tokens: 38 },
+    });
+  });
+
+  const res = await post(server, "/v1/messages", {
+    model: "gpt-4o",
+    max_tokens: 64,
+    tools: [{ name: "get_weather", description: "Look up weather", input_schema: { type: "object" } }],
+    tool_choice: { type: "tool", name: "get_weather" },
+    messages: [{ role: "user", content: "weather in SF?" }],
+  });
+  assert.equal(res.status, 200);
+
+  // Upstream got OpenAI-shaped tools + a named tool_choice (the 6b/6e fixes).
+  assert.ok(sent, "upstream was called");
+  const body = sent as { tools: { type: string; function: { name: string } }[]; tool_choice: unknown };
+  assert.equal(body.tools[0].type, "function");
+  assert.equal(body.tools[0].function.name, "get_weather");
+  assert.deepEqual(body.tool_choice, { type: "function", function: { name: "get_weather" } });
+
+  // Response: the tool_call became a tool_use block with parsed input, and
+  // stop_reason upgraded to tool_use.
+  const out = (await res.json()) as {
+    content: { type: string; id?: string; name?: string; input?: unknown }[];
+    stop_reason: string;
+  };
+  assert.equal(out.stop_reason, "tool_use");
+  const toolBlock = out.content.find((b) => b.type === "tool_use");
+  assert.ok(toolBlock, "expected a tool_use block");
+  assert.equal(toolBlock.id, "call_1");
+  assert.equal(toolBlock.name, "get_weather");
+  assert.deepEqual(toolBlock.input, { city: "SF" });
+});
+
+test("POST /v1/messages (tools, stream) reassembles arg fragments into input_json_delta", async () => {
+  const server = app(async () =>
+    sse([
+      {
+        choices: [
+          {
+            delta: {
+              role: "assistant",
+              tool_calls: [{ index: 0, id: "call_9", type: "function", function: { name: "search", arguments: "" } }],
+            },
+          },
+        ],
+      },
+      { choices: [{ delta: { tool_calls: [{ index: 0, function: { arguments: '{"q":"' } }] } }] },
+      { choices: [{ delta: { tool_calls: [{ index: 0, function: { arguments: 'cats"}' } }] } }] },
+      { choices: [{ delta: {}, finish_reason: "tool_calls" }], usage: { prompt_tokens: 20, completion_tokens: 9, total_tokens: 29 } },
+    ]),
+  );
+  const res = await post(server, "/v1/messages", {
+    model: "gpt-4o",
+    stream: true,
+    tools: [{ name: "search", input_schema: { type: "object" } }],
+    messages: [{ role: "user", content: "find cats" }],
+  });
+  assert.equal(res.status, 200);
+  const text = await res.text();
+
+  const events = [...text.matchAll(/^event: (.+)$/gm)].map((m) => m[1]);
+  assert.deepEqual(events, [
+    "message_start",
+    "content_block_start",
+    "content_block_delta",
+    "content_block_delta",
+    "content_block_stop",
+    "message_delta",
+    "message_stop",
+  ]);
+  // The tool_use block opens with id+name, and the arg fragments are forwarded
+  // verbatim as input_json_delta (the harness concatenates them).
+  assert.match(text, /"type":"tool_use","id":"call_9","name":"search"/);
+  assert.match(text, /"input_json_delta","partial_json":"\{\\"q\\":\\""/);
+  assert.match(text, /"input_json_delta","partial_json":"cats\\"\}"/);
+  assert.match(text, /"stop_reason":"tool_use"/);
+});
+
+test("POST /v1/messages forwards cache_control breakpoints upstream (Defect A1)", async () => {
+  let sent: { messages: { content: unknown }[]; tools?: { function: { cache_control?: unknown } }[] } | null = null;
+  const server = app(async (_url, init) => {
+    sent = JSON.parse(String(init?.body ?? "{}"));
+    return json({
+      id: "cc-1",
+      model: "gpt-4o",
+      choices: [{ index: 0, message: { role: "assistant", content: "ok" }, finish_reason: "stop" }],
+      usage: { prompt_tokens: 5, completion_tokens: 1, total_tokens: 6 },
+    });
+  });
+
+  await post(server, "/v1/messages", {
+    model: "gpt-4o",
+    max_tokens: 16,
+    system: [{ type: "text", text: "you are helpful", cache_control: { type: "ephemeral" } }],
+    tools: [{ name: "t", input_schema: { type: "object" }, cache_control: { type: "ephemeral" } }],
+    messages: [{ role: "user", content: "hi" }],
+  });
+
+  assert.ok(sent, "upstream was called");
+  const body = sent as {
+    messages: { content: { type: string; cache_control?: unknown }[] }[];
+    tools: { function: { cache_control?: unknown } }[];
+  };
+  // The system breakpoint survives on the system message's text part...
+  const systemPart = body.messages[0].content[0];
+  assert.deepEqual(systemPart.cache_control, { type: "ephemeral" });
+  // ...and the tool breakpoint survives on the function. The LM API dropped both.
+  assert.deepEqual(body.tools[0].function.cache_control, { type: "ephemeral" });
+});
+
+test("POST /v1/messages surfaces cache_read + cache_creation usage (compaction inputs)", async () => {
+  // The bridge goes direct precisely so CC sees real cache reads AND writes; the
+  // write count is what lets the harness size the prefix and decide to compact.
+  const server = app(async () =>
+    json({
+      id: "cc-1",
+      model: "gpt-4o",
+      choices: [{ index: 0, message: { role: "assistant", content: "ok" }, finish_reason: "stop" }],
+      usage: {
+        prompt_tokens: 1000,
+        completion_tokens: 10,
+        total_tokens: 1010,
+        prompt_tokens_details: { cached_tokens: 800, cache_creation_input_tokens: 120 },
+      },
+    }),
+  );
+  const res = await post(server, "/v1/messages", {
+    model: "gpt-4o",
+    max_tokens: 32,
+    messages: [{ role: "user", content: "hi" }],
+  });
+  assert.equal(res.status, 200);
+  const body = (await res.json()) as {
+    usage: { cache_read_input_tokens: number; cache_creation_input_tokens: number };
+  };
+  assert.equal(body.usage.cache_read_input_tokens, 800);
+  assert.equal(body.usage.cache_creation_input_tokens, 120);
+});
+
+test("POST /v1/messages tears down the upstream call when the client disconnects", async () => {
+  // Proves the abort wiring at the client seam: the Copilot client now forwards
+  // its AbortSignal to the transport (the fix), so an aborted request reaches the
+  // upstream fetch. We assert against the client directly rather than through
+  // Hono's in-process request helper, which does not propagate a signal to
+  // c.req.raw.signal the way the node-server adapter does at runtime.
+  authOk();
+  let upstreamSawAbort = false;
+  const abortRejection = () => {
+    upstreamSawAbort = true;
+    const e = new Error("aborted");
+    e.name = "AbortError";
+    return e;
+  };
+  __setCopilotDeps({
+    fetch: ((_url: string, init?: RequestInit) => {
+      const signal = init?.signal as AbortSignal | undefined;
+      return new Promise<Response>((_resolve, reject) => {
+        if (!signal) return reject(new Error("no signal threaded to the upstream fetch"));
+        // The signal may already be aborted by the time the fetch runs (the
+        // client aborts before send() finishes its token hop), so check both the
+        // already-aborted state and the future event — exactly as curlFetch does.
+        if (signal.aborted) return reject(abortRejection());
+        signal.addEventListener("abort", () => reject(abortRejection()), { once: true });
+      });
+    }) as unknown as typeof fetch,
+  });
+
+  const ac = new AbortController();
+  const call = chatCompletion({ model: "gpt-4o", messages: [] }, ac.signal);
+  ac.abort(); // client goes away mid-flight
+  await assert.rejects(call, (e: Error) => e.name === "AbortError");
+  assert.equal(upstreamSawAbort, true, "the upstream fetch should have seen the abort signal");
 });
