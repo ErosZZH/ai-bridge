@@ -1,0 +1,34 @@
+import { serve } from "@hono/node-server";
+
+import { ensureAuth } from "./auth/index.js";
+import { loadConfig } from "./config.js";
+import { Logger, ensureLogDir } from "./obs/index.js";
+import { createServer } from "./server/index.js";
+
+async function main() {
+  const config = loadConfig();
+  ensureLogDir(config.logDir);
+  const logger = new Logger(config.logLevel);
+
+  const prompt = await ensureAuth();
+  if (prompt) {
+    logger.info(
+      `GitHub auth required: open ${prompt.verificationUri} and enter ${prompt.userCode}`,
+    );
+  }
+
+  const app = createServer(config, logger);
+
+  serve({ fetch: app.fetch, hostname: config.host, port: config.port }, () => {
+    logger.info(`listening on ${config.baseUrl}`);
+    logger.info(`logs: ${config.logDir}`);
+    logger.info("point Claude Code here:");
+    logger.info(`  export ANTHROPIC_BASE_URL=${config.baseUrl}`);
+    logger.info("  export ANTHROPIC_AUTH_TOKEN=ai-bridge");
+  });
+}
+
+main().catch((err) => {
+  console.error("[ai-bridge] fatal:", err);
+  process.exit(1);
+});
