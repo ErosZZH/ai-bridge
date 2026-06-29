@@ -7,6 +7,11 @@
 //
 // Full per-error capture files (the `log_file` field) are task 9; here we just
 // shape the body and pick the status. The handlers leave the log_file hook open.
+//
+// Note (task 11): the harness renders only `error.message` — it does NOT read
+// sibling fields like `log_file`/`request_id` out of the error body. The route's
+// errorBody() therefore appends both into the message string so they reach the
+// user's screen; the structured fields are retained for the session JSONL.
 
 import { CopilotRequestError } from "../copilot/index.js";
 

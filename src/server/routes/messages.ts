@@ -291,14 +291,23 @@ function capture(c: Ctx, err: unknown, scope: ErrorScope): string | undefined {
   });
 }
 
-// Anthropic error envelope plus the two observability fields the harness reads
-// from `error`: `request_id` (so the user can quote it) and `log_file` (the
-// capture path). agent-maestro nested `log_file` here too; we add the id.
+// Anthropic error envelope carrying the request id + capture path.
+//
+// The harness only ever RENDERS `error.message` (sourcemap
+// errorUtils.ts:formatAPIError → SystemAPIErrorMessage.tsx:59); it ignores any
+// sibling fields. So to make the capture file reachable on screen we must fold
+// the id + path INTO the message string. The structured `request_id`/`log_file`
+// fields are kept too — they survive into the session JSONL for programmatic
+// readers — but the message suffix is what the user actually sees.
 function errorBody(c: Ctx, type: AnthropicErrorType, message: string, logFile?: string) {
-  const body = anthropicError(type, message);
+  const requestId = c.get("requestId");
+  const suffix = logFile
+    ? ` (request_id: ${requestId}, log_file: ${logFile})`
+    : ` (request_id: ${requestId})`;
+  const body = anthropicError(type, message + suffix);
   return {
     ...body,
-    error: { ...body.error, request_id: c.get("requestId"), log_file: logFile },
+    error: { ...body.error, request_id: requestId, log_file: logFile },
   };
 }
 

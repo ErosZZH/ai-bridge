@@ -331,11 +331,16 @@ test("an errored request returns request_id + log_file and writes the capture", 
 
   const headerId = res.headers.get("x-request-id");
   const body = (await res.json()) as {
-    error: { type: string; request_id: string; log_file: string };
+    error: { type: string; message: string; request_id: string; log_file: string };
   };
   // The id in the body matches the header, so a user can quote either.
   assert.equal(body.error.request_id, headerId);
   assert.ok(body.error.log_file, "expected a log_file path in the error body");
+
+  // The harness only renders `error.message`, so the id + capture path must be
+  // folded into the message text to be visible on screen (task 11 finding).
+  assert.ok(body.error.message.includes(headerId as string));
+  assert.ok(body.error.message.includes(body.error.log_file));
 
   // The capture file actually exists, is named with the id, and holds the
   // upstream status — the real exchange agent-maestro could not see.
