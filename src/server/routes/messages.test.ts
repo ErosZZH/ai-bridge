@@ -1,9 +1,10 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { mkdtempSync, readFileSync, readdirSync } from "node:fs";
+import { mkdtempSync, readFileSync, readdirSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
+import { writeClaudeSettings } from "../../claude-config.js";
 import { __setAuthDeps } from "../../auth/index.js";
 import { __setCopilotDeps, chatCompletion } from "../../copilot/index.js";
 import { __setResponsesDeps } from "../../copilot/responses.js";
@@ -18,6 +19,11 @@ __setResponseDeps({ id: () => "msg_test" });
 // Error-path tests write capture files; isolate them in a temp dir instead of the
 // real ~/.ai-bridge/logs.
 const TEST_LOG_DIR = mkdtempSync(join(tmpdir(), "ai-bridge-test-"));
+// The route now reads ~/.claude/settings.json on every request to pin the model.
+// Keep route tests isolated from the developer's real Claude Code settings unless
+// a test explicitly swaps HOME with withTempHome().
+const TEST_HOME_DIR = mkdtempSync(join(tmpdir(), "ai-bridge-home-default-"));
+process.env.HOME = TEST_HOME_DIR;
 function testConfig() {
   return loadConfig({ AI_BRIDGE_LOG_DIR: TEST_LOG_DIR });
 }
@@ -108,6 +114,19 @@ function post(server: ReturnType<typeof createServer>, path: string, body: unkno
       body: JSON.stringify(body),
     }),
   );
+}
+
+async function withTempHome<T>(body: () => Promise<T> | T): Promise<T> {
+  const dir = mkdtempSync(join(tmpdir(), "ai-bridge-home-"));
+  const prev = process.env.HOME;
+  process.env.HOME = dir;
+  try {
+    return await body();
+  } finally {
+    if (prev === undefined) delete process.env.HOME;
+    else process.env.HOME = prev;
+    rmSync(dir, { recursive: true, force: true });
+  }
 }
 
 test("POST /v1/messages non-stream -> Anthropic Message with exact usage", async () => {
@@ -230,6 +249,85 @@ test("POST /v1/messages/count_tokens returns a positive input_tokens", async () 
   assert.equal(res.status, 200);
   const body = (await res.json()) as { input_tokens: number };
   assert.ok(body.input_tokens > 0, "expected a positive token count");
+});
+
+test("POST /v1/messages uses the configured gpt-5.5 model despite an inbound subagent override", async () => {
+  await withTempHome(async () => {
+    writeClaudeSettings({
+      baseUrl: "http://127.0.0.1:11500",
+      authToken: "ai-bridge",
+      model: "gpt-5.5",
+      maxInputTokens: 922000,
+    });
+    let captured: { url: string; body: unknown } | null = null;
+    const server = appWithResponses(async (url, init) => {
+      captured = { url: String(url), body: JSON.parse(String(init?.body ?? "{}")) };
+      return json({
+        id: "resp-override",
+        model: "gpt-5.5-2026-04-23",
+        status: "completed",
+        output: [{ type: "message", role: "assistant", content: [{ type: "output_text", text: "pinned" }] }],
+        usage: { input_tokens: 11, output_tokens: 2 },
+      });
+    });
+
+    const res = await post(server, "/v1/messages", {
+      model: "claude-sonnet-4-6",
+      temperature: 1,
+      messages: [{ role: "user", content: "hi" }],
+    });
+    assert.equal(res.status, 200);
+    const body = (await res.json()) as { content: { type: string; text: string }[] };
+    assert.deepEqual(body.content, [{ type: "text", text: "pinned" }]);
+
+    assert.ok(captured, "responses upstream was called");
+    assert.match((captured as { url: string }).url, /\/responses$/);
+    const sent = (captured as { body: { model?: string; temperature?: number } }).body;
+    assert.equal(sent.model, "gpt-5.5");
+    assert.equal(sent.temperature, 1);
+  });
+});
+
+test("POST /v1/messages without a configured model uses the inbound model", async () => {
+  await withTempHome(async () => {
+    let sentBody: { model?: string } | null = null;
+    const server = app(async (_url, init) => {
+      sentBody = JSON.parse(String(init?.body ?? "{}"));
+      return json({
+        id: "cc-1",
+        model: "gpt-4o",
+        choices: [{ index: 0, message: { role: "assistant", content: "ok" }, finish_reason: "stop" }],
+        usage: { prompt_tokens: 1, completion_tokens: 1, total_tokens: 2 },
+      });
+    });
+    const res = await post(server, "/v1/messages", {
+      model: "gpt-4o",
+      max_tokens: 8,
+      messages: [{ role: "user", content: "hi" }],
+    });
+    assert.equal(res.status, 200);
+    assert.ok(sentBody, "upstream was called");
+    assert.equal((sentBody as { model: string }).model, "gpt-4o");
+  });
+});
+
+test("POST /v1/messages/count_tokens uses the configured model", async () => {
+  await withTempHome(async () => {
+    writeClaudeSettings({
+      baseUrl: "http://127.0.0.1:11500",
+      authToken: "ai-bridge",
+      model: "claude-opus-4.8",
+      maxInputTokens: 936000,
+    });
+    const server = app(async () => json({}, 200));
+    const res = await post(server, "/v1/messages/count_tokens", {
+      model: "totally-made-up",
+      messages: [{ role: "user", content: "count with configured model" }],
+    });
+    assert.equal(res.status, 200);
+    const body = (await res.json()) as { input_tokens: number };
+    assert.ok(body.input_tokens > 0, "expected a positive token count");
+  });
 });
 
 test("POST /v1/messages routes a /responses-only model through the Responses path", async () => {

@@ -23,6 +23,7 @@ import {
   mapResponsesResponse,
   streamResponsesResponse,
 } from "../../convert/index.js";
+import { readConfiguredModel } from "../../claude-config.js";
 import {
   CopilotAuthError,
   CopilotRequestError,
@@ -84,6 +85,16 @@ function parseBody(raw: unknown): InboundRequest {
   return body as InboundRequest;
 }
 
+// The user's selected model in ~/.claude/settings.json is the bridge's source of
+// truth. Claude Code subagents can send their own model overrides; pinning here
+// keeps all traffic on the selected backend route (for example gpt-5.5 /responses)
+// unless no model has been configured yet.
+function withConfiguredModel(body: InboundRequest): InboundRequest {
+  const configured = readConfiguredModel();
+  if (!configured || configured === body.model) return body;
+  return { ...body, model: configured };
+}
+
 export function registerMessageRoutes(app: {
   post: (path: string, handler: (c: Ctx) => Promise<Response>) => unknown;
 }): void {
@@ -114,7 +125,7 @@ async function handleMessages(c: Ctx): Promise<Response> {
   const logger = c.get("logger");
   let raw: InboundRequest;
   try {
-    raw = parseBody(await c.req.json());
+    raw = withConfiguredModel(parseBody(await c.req.json()));
   } catch (err) {
     const message = err instanceof Error ? err.message : "request body is not valid JSON";
     return c.json(anthropicError("invalid_request_error", message), 400);
@@ -288,7 +299,7 @@ async function handleCountTokens(c: Ctx): Promise<Response> {
   const logger = c.get("logger");
   let body: InboundRequest;
   try {
-    body = parseBody(await c.req.json());
+    body = withConfiguredModel(parseBody(await c.req.json()));
   } catch (err) {
     const message = err instanceof Error ? err.message : "request body is not valid JSON";
     return c.json(anthropicError("invalid_request_error", message), 400);

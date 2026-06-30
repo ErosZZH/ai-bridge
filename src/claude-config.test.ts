@@ -7,6 +7,7 @@ import test from "node:test";
 import {
   DEFAULT_MODEL,
   claudeSettingsPath,
+  readConfiguredModel,
   syncClaudeConnection,
   withClaudeCode1mSuffix,
   writeClaudeSettings,
@@ -162,5 +163,24 @@ test("syncClaudeConnection creates settings.json when none exists yet", () => {
     assert.equal(onDisk.env.ANTHROPIC_AUTH_TOKEN, "ai-bridge");
     // No model written yet — a later `ai-bridge login` fills it in.
     assert.equal(onDisk.env.ANTHROPIC_MODEL, undefined);
+  });
+});
+
+test("readConfiguredModel returns the selected bare model without the 1m suffix", () => {
+  withTempHome(() => {
+    writeClaudeSettings({
+      baseUrl: "http://127.0.0.1:11500",
+      authToken: "ai-bridge",
+      model: "gpt-5.5",
+      maxInputTokens: 922000,
+    });
+    assert.equal(readConfiguredModel(), "gpt-5.5");
+  });
+});
+
+test("readConfiguredModel returns undefined when no model is configured", () => {
+  withTempHome(() => {
+    syncClaudeConnection({ baseUrl: "http://127.0.0.1:11501", authToken: "ai-bridge" });
+    assert.equal(readConfiguredModel(), undefined);
   });
 });

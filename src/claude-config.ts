@@ -127,3 +127,14 @@ export function syncClaudeConnection(input: ClaudeConnectionInput): string {
 
   return persistSettings(path, settings);
 }
+
+// Read the model Claude Code is configured to use. The optional [1m] suffix is a
+// Claude Code routing marker, not part of the Copilot catalog id, so callers get
+// the bare model id to resolve and forward upstream.
+export function readConfiguredModel(): string | undefined {
+  const settings = readSettings(claudeSettingsPath());
+  const raw = settings.env?.ANTHROPIC_MODEL;
+  if (!raw || typeof raw !== "string") return undefined;
+  const model = raw.trim().replace(/\[1m\]$/, "");
+  return model.length ? model : undefined;
+}
