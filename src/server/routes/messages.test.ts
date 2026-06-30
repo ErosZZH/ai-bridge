@@ -645,7 +645,7 @@ test("POST /v1/messages tears down the upstream call when the client disconnects
         if (!signal) return reject(new Error("no signal threaded to the upstream fetch"));
         // The signal may already be aborted by the time the fetch runs (the
         // client aborts before send() finishes its token hop), so check both the
-        // already-aborted state and the future event — exactly as copilotFetch does.
+        // already-aborted state and the future event — exactly as curlFetch does.
         if (signal.aborted) return reject(abortRejection());
         signal.addEventListener("abort", () => reject(abortRejection()), { once: true });
       });

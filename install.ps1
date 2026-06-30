@@ -316,11 +316,15 @@ function Invoke-Preflight {
         throw "npm not found on PATH. Install Node.js >= 22 first."
     }
 
+    # node-libcurl (5.x) calls tls.getCACertificates() at module init, which only
+    # exists in Node >= 22.15. On older 22.x the native addon fails to load with a
+    # bare "Invalid argument", so require 22.15 explicitly rather than just 22.
     $ver   = (& node -p 'process.versions.node')
     $parts = $ver.Split('.')
     $major = [int]$parts[0]
-    if ($major -lt 22) {
-        throw "Node.js >= 22 required, found v$ver. Upgrade Node (e.g. ``nvm install 22``) and re-run."
+    $minor = [int]$parts[1]
+    if ($major -lt 22 -or ($major -eq 22 -and $minor -lt 15)) {
+        throw "Node.js >= 22.15 required (node-libcurl uses tls.getCACertificates), found v$ver. Upgrade Node (e.g. ``nvm install 22.15.0``) and re-run."
     }
     Write-Info "using v$ver at $($node.Source)"
     return $node.Source
@@ -334,14 +338,16 @@ function Invoke-Build {
 
     Push-Location $RepoDir
     try {
-        # impit ships prebuilt napi binaries for Windows x64/arm64 (pulled as
-        # optionalDependencies), so a normal install needs no C/C++ toolchain --
-        # this is the whole reason ai-bridge moved off node-libcurl, whose Windows
-        # build had to be compiled from source and routinely failed. `npm install`
+        # --ignore-scripts: node-libcurl's preinstall (vcpkg-setup.js) hard-fails on
+        # Windows because it builds curl with HTTP/3 (ngtcp2), which needs QUIC
+        # OpenSSL symbols the pinned OpenSSL 3.0.x doesn't export. We build the
+        # addon ourselves in Build-NodeLibcurl with HTTP/3 dropped. `npm install`
         # (not `npm ci`) so an already-built node_modules is preserved across re-runs.
-        Write-Info "installing dependencies"
-        & npm install
+        Write-Info "installing dependencies (lifecycle scripts deferred)"
+        & npm install --ignore-scripts
         if ($LASTEXITCODE -ne 0) { throw "npm install failed" }
+
+        Build-NodeLibcurl -NodeBin $NodeBin
 
         Write-Info "building release output (npm run build)"
         & npm run build
@@ -352,6 +358,105 @@ function Invoke-Build {
 
     if (-not (Test-Path $DistEntry)) { throw "build did not produce $DistEntry" }
     Write-Info "built $DistEntry"
+}
+
+# Detect a usable MSVC C++ toolchain (needed to compile node-libcurl from source).
+# vswhere is the canonical probe; fall back to cl.exe on PATH.
+function Test-MsvcAvailable {
+    $vswhere = Join-Path ${env:ProgramFiles(x86)} 'Microsoft Visual Studio\Installer\vswhere.exe'
+    if (Test-Path $vswhere) {
+        $inst = & $vswhere -latest -products * `
+            -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 `
+            -property installationPath 2>$null
+        if ($inst) { return $true }
+    }
+    if (Get-Command cl.exe -ErrorAction SilentlyContinue) { return $true }
+    return $false
+}
+
+# =============================================================================
+# node-libcurl native build (Windows) -- without HTTP/3
+# =============================================================================
+# The published prebuilt is linked against a QUIC-enabled OpenSSL and faults at
+# load here, and the from-source default enables curl's http3 feature (ngtcp2),
+# which fails to configure against the pinned OpenSSL 3.0.x (missing QUIC TLS
+# symbols). ai-bridge only needs libcurl's TLS fingerprint + HTTP/2, so we build
+# curl from source with http3 (and the unused autotools-only features) dropped.
+function Build-NodeLibcurl {
+    param([string]$NodeBin)
+
+    $nlc     = Join-Path $RepoDir 'node_modules\node-libcurl'
+    if (-not (Test-Path $nlc)) { throw "node-libcurl is not installed under node_modules" }
+
+    # Idempotent: if the addon already loads (e.g. a re-run), skip the slow build.
+    Push-Location $RepoDir
+    try { & $NodeBin -e "require('node-libcurl').Curl.getVersion()" 2>$null } finally { Pop-Location }
+    if ($LASTEXITCODE -eq 0) {
+        Write-Info "node-libcurl already built and loadable -- skipping native build"
+        return
+    }
+
+    # The prebuilt is broken (QUIC), so a from-source compile is mandatory here --
+    # which needs the MSVC C++ toolchain. Fail fast with a clear pointer if absent,
+    # rather than letting vcpkg error out cryptically deep in the build.
+    if (-not (Test-MsvcAvailable)) {
+        throw @"
+node-libcurl must be compiled from source on Windows (the published prebuilt is broken),
+but the Visual Studio C++ build tools (MSVC) were not found. Install "Desktop development
+with C++" via the Visual Studio Installer, or the standalone Build Tools for Visual Studio,
+then re-run this installer:  https://visualstudio.microsoft.com/visual-cpp-build-tools/
+"@
+    }
+
+    Write-Info "building node-libcurl from source without HTTP/3 (avoids ngtcp2/OpenSSL-QUIC mismatch)"
+
+    # Trim curl's feature set: drop http3 (the blocker) plus gsasl/idn/ldap/tool
+    # (autotools-only, slow, unused by ai-bridge). Keep the TLS/HTTP-relevant set.
+    $trimmed = @'
+{
+  "name": "node-libcurl",
+  "version-string": "$$NODE_LIBCURL_VERSION$$",
+  "dependencies": [
+    {
+      "name": "curl",
+      "version>=": "8.17.0",
+      "features": [ "brotli", "c-ares", "http2", "openssl", "ssh", "sspi", "websockets", "zstd" ]
+    }
+  ],
+  "overrides": [ { "name": "openssl", "version": "$$OPENSSL_VERSION$$" } ]
+}
+'@
+    [System.IO.File]::WriteAllText((Join-Path $nlc 'vcpkg.template.json'), $trimmed, (New-Object System.Text.UTF8Encoding($false)))
+
+    # Drop the broken prebuilt + any stale generated manifest so we build from source.
+    Remove-Item -Force (Join-Path $nlc 'lib\binding\node_libcurl.node') -ErrorAction SilentlyContinue
+    Remove-Item -Force (Join-Path $nlc 'vcpkg.json') -ErrorAction SilentlyContinue
+
+    Push-Location $nlc
+    try {
+        & $NodeBin scripts/vcpkg-setup.js
+        if ($LASTEXITCODE -ne 0) { throw "node-libcurl vcpkg setup failed (curl source build)" }
+
+        # A malformed persistent VCINSTALLDIR/VSINSTALLDIR (e.g. pointing at
+        # "...\Visual Studio\2022" without the edition segment) makes node-gyp
+        # think it's in a VS Command Prompt and reject the real VS install with
+        # "does not match this Visual Studio Command Prompt". Clear them for this
+        # process so node-gyp falls back to normal auto-detection, and pin the
+        # version explicitly (a VS 18 preview install confuses node-gyp's parser).
+        Remove-Item Env:VCINSTALLDIR -ErrorAction SilentlyContinue
+        Remove-Item Env:VSINSTALLDIR -ErrorAction SilentlyContinue
+        $env:GYP_MSVS_VERSION = '2022'
+
+        & npx node-pre-gyp configure build
+        if ($LASTEXITCODE -ne 0) { throw "node-libcurl native addon build failed" }
+    } finally {
+        Pop-Location
+    }
+
+    Push-Location $RepoDir
+    try { & $NodeBin -e "require('node-libcurl').Curl.getVersion()" } finally { Pop-Location }
+    if ($LASTEXITCODE -ne 0) { throw "node-libcurl built but failed to load" }
+    Write-Info "node-libcurl built and loadable"
 }
 
 # =============================================================================

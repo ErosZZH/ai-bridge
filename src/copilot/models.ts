@@ -13,7 +13,7 @@ import {
   getCopilotToken,
   reauthCopilotToken,
 } from "../auth/index.js";
-import { copilotFetch } from "./copilotFetch.js";
+import { curlFetch } from "./curlFetch.js";
 import { CopilotRequestError } from "./index.js";
 
 export const MODELS_TTL_MS = 5 * 60 * 1000;
@@ -50,7 +50,7 @@ type RawModel = {
   };
 };
 
-let fetchImpl: typeof fetch = copilotFetch;
+let fetchImpl: typeof fetch = curlFetch;
 let nowMs: () => number = () => Date.now();
 export function __setModelsDeps(deps: { fetch?: typeof fetch; now?: () => number }) {
   if (deps.fetch) fetchImpl = deps.fetch;
