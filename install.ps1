@@ -5,8 +5,12 @@
 .DESCRIPTION
     Builds the release output (npm run build -> dist\), then registers a
     Scheduled Task that launches the bridge at logon and restarts it on
-    failure. The task runs in your user session (no administrator required),
-    so it can read your GitHub Copilot credentials and write ~/.claude.
+    failure. Registering the task requires administrator rights: if the
+    installer is not elevated it relaunches an elevated child (via UAC) to
+    register the task, and aborts if elevation is declined or blocked. There
+    is no non-admin fallback. The task runs as your user account in a hidden
+    background session (no console window), so it can read your GitHub Copilot
+    credentials and write ~/.claude.
 
     Also installs an `ai-bridge` CLI wrapper (ai-bridge.cmd) on your user PATH
     so you can run `ai-bridge login` / `ai-bridge model` interactively.
@@ -22,7 +26,14 @@
 #>
 [CmdletBinding()]
 param(
-    [switch]$Uninstall
+    [switch]$Uninstall,
+    # --- internal: used when the installer relaunches an elevated child solely to
+    # register (or unregister) the Scheduled Task. Not intended to be passed by users. ---
+    [switch]$RegisterTaskOnly,
+    [switch]$UnregisterTaskOnly,
+    [string]$TaskLauncher,
+    [string]$TaskWorkingDir,
+    [string]$TaskUser
 )
 
 $ErrorActionPreference = 'Stop'
@@ -37,6 +48,13 @@ $ServiceLauncher = Join-Path $BinDir 'ai-bridge-service.cmd'
 
 function Write-Info { param([string]$Msg) Write-Host "==> $Msg" -ForegroundColor Cyan }
 function Write-Warn { param([string]$Msg) Write-Host "warning: $Msg" -ForegroundColor Yellow }
+
+# True when the current process is running with an elevated (Administrator) token.
+function Test-Admin {
+    $id = [Security.Principal.WindowsIdentity]::GetCurrent()
+    $principal = New-Object Security.Principal.WindowsPrincipal($id)
+    return $principal.IsInRole([Security.Principal.WindowsBuiltinRole]::Administrator)
+}
 
 # --- proxy detection ---------------------------------------------------------
 # The scheduled task runs in a logon session that does NOT inherit the proxy you
@@ -66,7 +84,7 @@ function Invoke-DetectProxy {
     }
 
     if ($script:ProxyUrl) {
-        Write-Info "detected proxy $($script:ProxyUrl) — baking it into the service env"
+        Write-Info "detected proxy $($script:ProxyUrl) -- baking it into the service env"
     } else {
         Write-Info "no proxy detected in env; service will connect directly"
         Write-Warn "if Copilot withholds models (e.g. Claude) without a proxy, re-run with:`n    `$env:AI_BRIDGE_PROXY='http://host:port'; .\install.ps1"
@@ -79,7 +97,7 @@ function Invoke-DetectProxy {
 # The service mints short-lived Copilot bearer tokens from a long-lived GitHub
 # oauth_token on disk (apps.json/hosts.json, written by VS Code Copilot, gh, or
 # our own `ai-bridge login`). If that token is absent the service starts but
-# answers 401 to every request — and because it caches the empty credential set
+# answers 401 to every request -- and because it caches the empty credential set
 # at startup, a later `ai-bridge login` won't recover until the task is
 # restarted. So sign in BEFORE registering the task. Mirrors
 # findCopilotConfigDirs()/readGitHubTokens() in src/auth/index.ts (win32 dirs).
@@ -106,7 +124,7 @@ function Test-CopilotCreds {
 function Invoke-EnsureLogin {
     param([string]$NodeBin)
     if (Test-CopilotCreds) {
-        Write-Info "GitHub Copilot credentials already present — skipping login"
+        Write-Info "GitHub Copilot credentials already present -- skipping login"
         return
     }
     Write-Info "no GitHub Copilot credentials found; starting sign-in before the service launches"
@@ -121,14 +139,61 @@ function Invoke-EnsureLogin {
 # =============================================================================
 # uninstall
 # =============================================================================
-function Invoke-Uninstall {
-    if (Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue) {
-        Stop-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue
-        Unregister-ScheduledTask -TaskName $TaskName -Confirm:$false
-        Write-Info "removed scheduled task '$TaskName'"
-    } else {
+
+# Remove the Scheduled Task, elevating if necessary. Unregister-ScheduledTask
+# fails with a NON-TERMINATING "Access is denied" for a standard user, which
+# slips past $ErrorActionPreference='Stop' -- so we must check Get-ScheduledTask
+# afterwards rather than trust the call. Mirrors the install path
+# (Invoke-ElevatedTaskRegister): already-admin removes in-process; otherwise we
+# relaunch an elevated child (UAC) to do it. Returns $true once the task is gone.
+function Remove-AiBridgeTask {
+    if (-not (Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue)) {
         Write-Info "scheduled task '$TaskName' not present"
+        return $true
     }
+
+    if (Test-Admin) {
+        Stop-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue
+        Unregister-ScheduledTask -TaskName $TaskName -Confirm:$false -ErrorAction SilentlyContinue
+    } else {
+        Write-Info "removing the Scheduled Task requires administrator rights."
+        Write-Host "    A UAC prompt will ask you to approve (or sign in as) an administrator." -ForegroundColor Yellow
+        $scriptPath = $PSCommandPath
+        if (-not $scriptPath) { $scriptPath = $MyInvocation.MyCommand.Path }
+        $argList = @(
+            '-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', "`"$scriptPath`"",
+            '-UnregisterTaskOnly'
+        )
+        try {
+            Start-Process -FilePath 'powershell.exe' -ArgumentList $argList `
+                -Verb RunAs -Wait -ErrorAction Stop | Out-Null
+        } catch {
+            Write-Warn "elevation was declined or blocked ($($_.Exception.Message.Trim()))."
+        }
+    }
+
+    # Trust the state, not the exit path: confirm the task is actually gone.
+    if (Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue) {
+        Write-Warn "could not remove scheduled task '$TaskName'. Re-run from an elevated PowerShell:`n    Stop-ScheduledTask -TaskName $TaskName; Unregister-ScheduledTask -TaskName $TaskName -Confirm:`$false"
+        return $false
+    }
+    Write-Info "removed scheduled task '$TaskName'"
+    return $true
+}
+
+function Invoke-Uninstall {
+    Remove-AiBridgeTask | Out-Null
+
+    # Remove the per-user logon fallback (HKCU Run) if it was used.
+    $runKey = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Run'
+    if (Get-ItemProperty -Path $runKey -Name $TaskName -ErrorAction SilentlyContinue) {
+        Remove-ItemProperty -Path $runKey -Name $TaskName -ErrorAction SilentlyContinue
+        Write-Info "removed logon auto-start $runKey\$TaskName"
+    }
+    # Stop any running bridge started via the fallback.
+    Get-CimInstance Win32_Process -Filter "Name='node.exe'" -ErrorAction SilentlyContinue |
+        Where-Object { $_.CommandLine -like "*$DistEntry*" } |
+        ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
 
     if (Test-Path $Wrapper) {
         Remove-Item $Wrapper -Force
@@ -159,11 +224,17 @@ function Invoke-Preflight {
         throw "npm not found on PATH. Install Node.js >= 22 first."
     }
 
-    $major = [int](& node -p 'process.versions.node.split(".")[0]')
-    if ($major -lt 22) {
-        throw "Node.js >= 22 required, found $(& node -v). Upgrade Node and re-run."
+    # node-libcurl (5.x) calls tls.getCACertificates() at module init, which only
+    # exists in Node >= 22.15. On older 22.x the native addon fails to load with a
+    # bare "Invalid argument", so require 22.15 explicitly rather than just 22.
+    $ver   = (& node -p 'process.versions.node')
+    $parts = $ver.Split('.')
+    $major = [int]$parts[0]
+    $minor = [int]$parts[1]
+    if ($major -lt 22 -or ($major -eq 22 -and $minor -lt 15)) {
+        throw "Node.js >= 22.15 required (node-libcurl uses tls.getCACertificates), found v$ver. Upgrade Node (e.g. ``nvm install 22.15.0``) and re-run."
     }
-    Write-Info "using $(& node -v) at $($node.Source)"
+    Write-Info "using v$ver at $($node.Source)"
     return $node.Source
 }
 
@@ -171,12 +242,20 @@ function Invoke-Preflight {
 # release build
 # =============================================================================
 function Invoke-Build {
+    param([string]$NodeBin)
+
     Push-Location $RepoDir
     try {
-        Write-Info "installing dependencies"
-        & npm ci
-        if ($LASTEXITCODE -ne 0) { & npm install }
+        # --ignore-scripts: node-libcurl's preinstall (vcpkg-setup.js) hard-fails on
+        # Windows because it builds curl with HTTP/3 (ngtcp2), which needs QUIC
+        # OpenSSL symbols the pinned OpenSSL 3.0.x doesn't export. We build the
+        # addon ourselves in Build-NodeLibcurl with HTTP/3 dropped. `npm install`
+        # (not `npm ci`) so an already-built node_modules is preserved across re-runs.
+        Write-Info "installing dependencies (lifecycle scripts deferred)"
+        & npm install --ignore-scripts
         if ($LASTEXITCODE -ne 0) { throw "npm install failed" }
+
+        Build-NodeLibcurl -NodeBin $NodeBin
 
         Write-Info "building release output (npm run build)"
         & npm run build
@@ -187,6 +266,94 @@ function Invoke-Build {
 
     if (-not (Test-Path $DistEntry)) { throw "build did not produce $DistEntry" }
     Write-Info "built $DistEntry"
+}
+
+# Detect a usable MSVC C++ toolchain (needed to compile node-libcurl from source).
+# vswhere is the canonical probe; fall back to cl.exe on PATH.
+function Test-MsvcAvailable {
+    $vswhere = Join-Path ${env:ProgramFiles(x86)} 'Microsoft Visual Studio\Installer\vswhere.exe'
+    if (Test-Path $vswhere) {
+        $inst = & $vswhere -latest -products * `
+            -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 `
+            -property installationPath 2>$null
+        if ($inst) { return $true }
+    }
+    if (Get-Command cl.exe -ErrorAction SilentlyContinue) { return $true }
+    return $false
+}
+
+# =============================================================================
+# node-libcurl native build (Windows) -- without HTTP/3
+# =============================================================================
+# The published prebuilt is linked against a QUIC-enabled OpenSSL and faults at
+# load here, and the from-source default enables curl's http3 feature (ngtcp2),
+# which fails to configure against the pinned OpenSSL 3.0.x (missing QUIC TLS
+# symbols). ai-bridge only needs libcurl's TLS fingerprint + HTTP/2, so we build
+# curl from source with http3 (and the unused autotools-only features) dropped.
+function Build-NodeLibcurl {
+    param([string]$NodeBin)
+
+    $nlc     = Join-Path $RepoDir 'node_modules\node-libcurl'
+    if (-not (Test-Path $nlc)) { throw "node-libcurl is not installed under node_modules" }
+
+    # Idempotent: if the addon already loads (e.g. a re-run), skip the slow build.
+    Push-Location $RepoDir
+    try { & $NodeBin -e "require('node-libcurl').Curl.getVersion()" 2>$null } finally { Pop-Location }
+    if ($LASTEXITCODE -eq 0) {
+        Write-Info "node-libcurl already built and loadable -- skipping native build"
+        return
+    }
+
+    # The prebuilt is broken (QUIC), so a from-source compile is mandatory here --
+    # which needs the MSVC C++ toolchain. Fail fast with a clear pointer if absent,
+    # rather than letting vcpkg error out cryptically deep in the build.
+    if (-not (Test-MsvcAvailable)) {
+        throw @"
+node-libcurl must be compiled from source on Windows (the published prebuilt is broken),
+but the Visual Studio C++ build tools (MSVC) were not found. Install "Desktop development
+with C++" via the Visual Studio Installer, or the standalone Build Tools for Visual Studio,
+then re-run this installer:  https://visualstudio.microsoft.com/visual-cpp-build-tools/
+"@
+    }
+
+    Write-Info "building node-libcurl from source without HTTP/3 (avoids ngtcp2/OpenSSL-QUIC mismatch)"
+
+    # Trim curl's feature set: drop http3 (the blocker) plus gsasl/idn/ldap/tool
+    # (autotools-only, slow, unused by ai-bridge). Keep the TLS/HTTP-relevant set.
+    $trimmed = @'
+{
+  "name": "node-libcurl",
+  "version-string": "$$NODE_LIBCURL_VERSION$$",
+  "dependencies": [
+    {
+      "name": "curl",
+      "version>=": "8.17.0",
+      "features": [ "brotli", "c-ares", "http2", "openssl", "ssh", "sspi", "websockets", "zstd" ]
+    }
+  ],
+  "overrides": [ { "name": "openssl", "version": "$$OPENSSL_VERSION$$" } ]
+}
+'@
+    [System.IO.File]::WriteAllText((Join-Path $nlc 'vcpkg.template.json'), $trimmed, (New-Object System.Text.UTF8Encoding($false)))
+
+    # Drop the broken prebuilt + any stale generated manifest so we build from source.
+    Remove-Item -Force (Join-Path $nlc 'lib\binding\node_libcurl.node') -ErrorAction SilentlyContinue
+    Remove-Item -Force (Join-Path $nlc 'vcpkg.json') -ErrorAction SilentlyContinue
+
+    Push-Location $nlc
+    try {
+        & $NodeBin scripts/vcpkg-setup.js
+        if ($LASTEXITCODE -ne 0) { throw "node-libcurl vcpkg setup failed (curl source build)" }
+        & npx node-pre-gyp configure build
+        if ($LASTEXITCODE -ne 0) { throw "node-libcurl native addon build failed" }
+    } finally {
+        Pop-Location
+    }
+
+    Push-Location $RepoDir
+    try { & $NodeBin -e "require('node-libcurl').Curl.getVersion()" } finally { Pop-Location }
+    if ($LASTEXITCODE -ne 0) { throw "node-libcurl built but failed to load" }
+    Write-Info "node-libcurl built and loadable"
 }
 
 # =============================================================================
@@ -200,7 +367,7 @@ function Install-Wrapper {
 @echo off
 "$NodeBin" "$DistEntry" %*
 "@
-    # ASCII, no BOM — cmd.exe chokes on a UTF-8 BOM at the top of a .cmd.
+    # ASCII, no BOM -- cmd.exe chokes on a UTF-8 BOM at the top of a .cmd.
     [System.IO.File]::WriteAllText($Wrapper, $cmd, [System.Text.Encoding]::ASCII)
     Write-Info "installed CLI wrapper at $Wrapper"
 
@@ -214,7 +381,7 @@ function Install-Wrapper {
 }
 
 # =============================================================================
-# Service launcher (.cmd) — sets env (incl. proxy) then runs the bridge
+# Service launcher (.cmd) -- sets env (incl. proxy) then runs the bridge
 # =============================================================================
 # Task Scheduler has no per-task environment setting (unlike systemd's
 # `Environment=` or launchd's `EnvironmentVariables`), so we bake the env into a
@@ -239,7 +406,7 @@ set "NODE_ENV=production"
 $proxyLines
 "$NodeBin" "$DistEntry" %*
 "@
-    # ASCII, no BOM — cmd.exe chokes on a UTF-8 BOM at the top of a .cmd.
+    # ASCII, no BOM -- cmd.exe chokes on a UTF-8 BOM at the top of a .cmd.
     [System.IO.File]::WriteAllText($ServiceLauncher, $cmd, [System.Text.Encoding]::ASCII)
     Write-Info "installed service launcher at $ServiceLauncher"
 }
@@ -247,9 +414,19 @@ $proxyLines
 # =============================================================================
 # Scheduled Task (logon trigger, restart on failure, user session)
 # =============================================================================
-function Install-Task {
-    $action = New-ScheduledTaskAction -Execute $ServiceLauncher `
-        -WorkingDirectory $RepoDir
+
+# Register the Scheduled Task itself. Requires an elevated token on locked-down
+# machines (standard users get "Access is denied" from the Task Scheduler).
+# Runs both in-process (when the installer is already admin) and inside the
+# elevated child we spawn via -RegisterTaskOnly. Returns nothing; throws on
+# failure so the caller can fall back to the HKCU logon entry.
+function Register-AiBridgeTask {
+    param(
+        [string]$Launcher,
+        [string]$WorkingDir,
+        [string]$User
+    )
+    $action = New-ScheduledTaskAction -Execute $Launcher -WorkingDirectory $WorkingDir
     $trigger = New-ScheduledTaskTrigger -AtLogOn
     $settings = New-ScheduledTaskSettingsSet `
         -AllowStartIfOnBatteries `
@@ -257,14 +434,74 @@ function Install-Task {
         -RestartCount 999 `
         -RestartInterval (New-TimeSpan -Minutes 1) `
         -ExecutionTimeLimit ([TimeSpan]::Zero)
-    $principal = New-ScheduledTaskPrincipal -UserId $env:USERNAME -LogonType Interactive
-
+    # Bind the task to the original (non-elevated) user so it runs with their
+    # Copilot creds + ~/.claude -- even when an admin elevated the child. LogonType
+    # S4U ("run whether logged on or not") runs the launcher in a HIDDEN, non-
+    # interactive background session: no console window is ever spawned, so there
+    # is nothing for the user to close that would kill the service. (Interactive,
+    # by contrast, attaches node to a visible cmd window whose close event tears
+    # the service down.) -RunLevel Limited keeps it off an elevated token.
+    $principal = New-ScheduledTaskPrincipal -UserId $User -LogonType S4U -RunLevel Limited
     Register-ScheduledTask -TaskName $TaskName -Action $action -Trigger $trigger `
         -Settings $settings -Principal $principal `
-        -Description 'ai-bridge — Claude Code to GitHub Copilot bridge' -Force | Out-Null
-    Write-Info "registered scheduled task '$TaskName' (runs at logon, restarts on failure)"
+        -Description 'ai-bridge -- Claude Code to GitHub Copilot bridge' -Force -ErrorAction Stop | Out-Null
+}
 
-    Start-ScheduledTask -TaskName $TaskName
+# Spawn an elevated copy of this script that does nothing but register the task,
+# then returns. UAC prompts the user to authenticate as an administrator. We pass
+# the launcher/workdir/user explicitly so the child needs no other state, and bind
+# the task to $env:USERNAME (the *current*, non-elevated user) regardless of which
+# admin account approves the prompt. Returns $true if the task now exists.
+function Invoke-ElevatedTaskRegister {
+    $scriptPath = $PSCommandPath
+    if (-not $scriptPath) { $scriptPath = $MyInvocation.MyCommand.Path }
+    $argList = @(
+        '-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', "`"$scriptPath`"",
+        '-RegisterTaskOnly',
+        '-TaskLauncher',   "`"$ServiceLauncher`"",
+        '-TaskWorkingDir', "`"$RepoDir`"",
+        '-TaskUser',       "`"$env:USERNAME`""
+    )
+    try {
+        $proc = Start-Process -FilePath 'powershell.exe' -ArgumentList $argList `
+            -Verb RunAs -Wait -PassThru -ErrorAction Stop
+    } catch {
+        # User clicked "No" on the UAC prompt, or elevation is blocked by policy.
+        Write-Warn "elevation was declined or blocked ($($_.Exception.Message.Trim()))."
+        return $false
+    }
+    if ($proc.ExitCode -ne 0) {
+        Write-Warn "elevated task registration exited with code $($proc.ExitCode)."
+        return $false
+    }
+    # Confirm the elevated child actually created the task before reporting success.
+    return [bool](Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue)
+}
+
+function Install-Task {
+    # A Scheduled Task (logon trigger + restart-on-failure) is the only supported
+    # mechanism. Registering it requires admin, so the path is:
+    #   1. already elevated      -> register in-process
+    #   2. not elevated          -> relaunch an elevated child (UAC) to register
+    #   3. declined / failed     -> abort with an error (no fallback)
+    if (Test-Admin) {
+        try {
+            Register-AiBridgeTask -Launcher $ServiceLauncher -WorkingDir $RepoDir -User $env:USERNAME
+            Start-ScheduledTask -TaskName $TaskName
+            Write-Info "registered scheduled task '$TaskName' (runs at logon, restarts on failure)"
+        } catch {
+            throw "could not register the Scheduled Task even while elevated ($($_.Exception.Message.Trim()))."
+        }
+    } else {
+        Write-Info "registering the auto-restart Scheduled Task requires administrator rights."
+        Write-Host "    A UAC prompt will ask you to approve (or sign in as) an administrator." -ForegroundColor Yellow
+        if (-not (Invoke-ElevatedTaskRegister)) {
+            throw "administrator elevation is required to register the Scheduled Task, but it was declined or failed. Re-run this installer from an elevated PowerShell, or approve the UAC prompt."
+        }
+        Start-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue
+        Write-Info "registered scheduled task '$TaskName' via elevation (runs at logon, restarts on failure)"
+    }
+
     Write-Info "started '$TaskName'"
 }
 
@@ -276,8 +513,38 @@ if ($Uninstall) {
     return
 }
 
+# Elevated child entry point: we were relaunched with -RegisterTaskOnly solely to
+# create the Scheduled Task. Do exactly that and exit with a clear code so the
+# parent (running as the normal user) can detect success/failure. Everything else
+# -- build, login, PATH -- already ran (or will run) in the non-elevated parent.
+if ($RegisterTaskOnly) {
+    try {
+        Register-AiBridgeTask -Launcher $TaskLauncher -WorkingDir $TaskWorkingDir -User $TaskUser
+        Write-Info "registered scheduled task '$TaskName' (elevated)"
+        exit 0
+    } catch {
+        Write-Warn "elevated registration failed: $($_.Exception.Message.Trim())"
+        exit 1
+    }
+}
+
+# Elevated child entry point for uninstall: relaunched with -UnregisterTaskOnly
+# solely to remove the Scheduled Task (Unregister-ScheduledTask needs admin on
+# locked-down machines). Exit code lets the non-elevated parent verify success.
+if ($UnregisterTaskOnly) {
+    try {
+        Stop-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue
+        Unregister-ScheduledTask -TaskName $TaskName -Confirm:$false -ErrorAction Stop
+        Write-Info "removed scheduled task '$TaskName' (elevated)"
+        exit 0
+    } catch {
+        Write-Warn "elevated unregister failed: $($_.Exception.Message.Trim())"
+        exit 1
+    }
+}
+
 $nodeBin = Invoke-Preflight
-Invoke-Build
+Invoke-Build -NodeBin $nodeBin
 Invoke-DetectProxy
 Install-Wrapper          -NodeBin $nodeBin
 Install-ServiceLauncher  -NodeBin $nodeBin
@@ -289,6 +556,7 @@ Install-Task
 
 Write-Host ""
 Write-Info "ai-bridge installed and running at http://127.0.0.1:11500"
+
 Write-Host @"
 
 Next steps:
@@ -303,5 +571,5 @@ Manage the service:
   logs:    %USERPROFILE%\.ai-bridge\logs
   remove:  .\install.ps1 -Uninstall
 
-(`ai-bridge` resolves in a new terminal — the installer just added it to PATH.)
+(`ai-bridge` resolves in a new terminal -- the installer just added it to PATH.)
 "@
