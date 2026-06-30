@@ -6,6 +6,7 @@ import { getCopilotToken, getGitHubToken, loginWithDeviceFlow } from "./auth/ind
 import {
   AUTH_TOKEN_VALUE,
   DEFAULT_MODEL,
+  syncClaudeConnection,
   withClaudeCode1mSuffix,
   writeClaudeSettings,
 } from "./claude-config.js";
@@ -81,6 +82,21 @@ async function selectModel() {
   console.log(`Wrote ${path}. Restart Claude Code for the change to take effect.`);
 }
 
+// `ai-bridge sync-config` reconciles ~/.claude/settings.json's base URL + auth
+// token with the port this install is configured for (AI_BRIDGE_PORT, baked in
+// by the installer), without touching the model or contacting the network. The
+// installer runs it on every install so a dynamically reselected port always
+// reaches Claude Code — even on re-installs where `login` is skipped because
+// Copilot creds already exist (the bug where settings.json kept a stale port).
+function syncConfig() {
+  const config = loadConfig();
+  const path = syncClaudeConnection({
+    baseUrl: config.baseUrl,
+    authToken: AUTH_TOKEN_VALUE,
+  });
+  console.log(`Reconciled ${path} -> ANTHROPIC_BASE_URL=${config.baseUrl}.`);
+}
+
 async function main() {
   const config = loadConfig();
   ensureLogDir(config.logDir);
@@ -113,7 +129,14 @@ async function main() {
 }
 
 const command = process.argv[2];
-const run = command === "login" ? login : command === "model" ? selectModel : main;
+const run =
+  command === "login"
+    ? login
+    : command === "model"
+      ? selectModel
+      : command === "sync-config"
+        ? async () => syncConfig()
+        : main;
 
 run().catch((err) => {
   console.error("[ai-bridge] fatal:", err);

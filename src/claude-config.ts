@@ -55,20 +55,41 @@ export type ClaudeSettingsInput = {
   maxInputTokens?: number;
 };
 
+// The connection-only subset of the env block: where Claude Code points and how
+// it authenticates. Kept separate from the model keys so the installer can
+// reconcile the base URL on every run without needing the live model catalog.
+export type ClaudeConnectionInput = {
+  baseUrl: string;
+  authToken: string;
+};
+
+// Read and parse ~/.claude/settings.json, tolerating absence and corruption.
+// A malformed file is treated as empty so a write reconstructs it rather than
+// failing the command (matches the prior writeClaudeSettings behaviour).
+function readSettings(path: string): ClaudeSettings {
+  if (!existsSync(path)) return {};
+  try {
+    const parsed = JSON.parse(readFileSync(path, "utf8"));
+    if (parsed && typeof parsed === "object") return parsed as ClaudeSettings;
+  } catch {
+    // malformed settings — overwrite rather than fail the command
+  }
+  return {};
+}
+
+// Serialize settings back to ~/.claude/settings.json, creating the dir if
+// needed. Returns the path written.
+function persistSettings(path: string, settings: ClaudeSettings): string {
+  mkdirSync(join(homedir(), ".claude"), { recursive: true });
+  writeFileSync(path, `${JSON.stringify(settings, null, 2)}\n`);
+  return path;
+}
+
 // Merge the three connection keys into ~/.claude/settings.json's env block,
 // preserving every other key already there. Returns the path written.
 export function writeClaudeSettings(input: ClaudeSettingsInput): string {
   const path = claudeSettingsPath();
-
-  let settings: ClaudeSettings = {};
-  if (existsSync(path)) {
-    try {
-      const parsed = JSON.parse(readFileSync(path, "utf8"));
-      if (parsed && typeof parsed === "object") settings = parsed as ClaudeSettings;
-    } catch {
-      // malformed settings — overwrite rather than fail the command
-    }
-  }
+  const settings = readSettings(path);
 
   settings.env = {
     ...settings.env,
@@ -82,7 +103,27 @@ export function writeClaudeSettings(input: ClaudeSettingsInput): string {
     settings.env.CLAUDE_CODE_AUTO_COMPACT_WINDOW = String(input.maxInputTokens);
   }
 
-  mkdirSync(join(homedir(), ".claude"), { recursive: true });
-  writeFileSync(path, `${JSON.stringify(settings, null, 2)}\n`);
-  return path;
+  return persistSettings(path, settings);
+}
+
+// Reconcile ONLY the connection keys (base URL + auth token) into
+// ~/.claude/settings.json, leaving the model, auto-compact window, and every
+// other key untouched. This is the installer's port-reconciliation hook: it runs
+// on every install — including re-installs where login is skipped because creds
+// already exist — so the base URL always tracks the port select_port() chose.
+// Without it, a dynamically reselected port (e.g. 11501 when WSL holds 11500)
+// never reaches settings.json and Claude Code keeps dialing the stale port.
+// Creates the file with just the connection keys when none exists yet; a later
+// `ai-bridge login` then fills in the model. Returns the path written.
+export function syncClaudeConnection(input: ClaudeConnectionInput): string {
+  const path = claudeSettingsPath();
+  const settings = readSettings(path);
+
+  settings.env = {
+    ...settings.env,
+    ANTHROPIC_BASE_URL: input.baseUrl,
+    ANTHROPIC_AUTH_TOKEN: input.authToken,
+  };
+
+  return persistSettings(path, settings);
 }

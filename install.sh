@@ -168,6 +168,22 @@ ensure_login() {
   fi
 }
 
+# Reconcile ~/.claude/settings.json's base URL with the port select_port() chose.
+# MUST run on every install, unconditionally — ensure_login() returns early (and
+# so never rewrites settings.json) whenever Copilot creds already exist, so on a
+# re-install the dynamically reselected port (e.g. 11501 when WSL holds 11500)
+# would otherwise never reach Claude Code, leaving it dialing the stale 11500 and
+# failing with ConnectionRefused once WSL's forwarder goes away. sync-config
+# patches only the base URL + auth token (model/window untouched) and needs no
+# network, so it is safe to run regardless of login state. AI_BRIDGE_PORT is
+# already exported by select_port(), so the child reads the SAME port.
+sync_config() {
+  local node_bin="$1"
+  if ! "$node_bin" "$DIST_ENTRY" sync-config; then
+    warn "could not reconcile ~/.claude/settings.json; set ANTHROPIC_BASE_URL=$BASE_URL there by hand if Claude Code can't connect."
+  fi
+}
+
 # =============================================================================
 # uninstall
 # =============================================================================
@@ -387,6 +403,10 @@ main() {
   # caches the empty credential set and answers 401 until restarted, so a later
   # login alone would not recover it.
   ensure_login "$node_bin"
+
+  # Reconcile settings.json's base URL with $PORT AFTER login. Unconditional by
+  # design: login is skipped when creds exist, but the port must sync every time.
+  sync_config "$node_bin"
 
   case "$OS" in
     Linux)  install_systemd "$node_bin" ;;

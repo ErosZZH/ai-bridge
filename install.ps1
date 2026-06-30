@@ -211,6 +211,23 @@ function Invoke-EnsureLogin {
     }
 }
 
+# Reconcile ~/.claude/settings.json's base URL with the port we just chose. MUST
+# run on every install, unconditionally -- Invoke-EnsureLogin returns early (and
+# so never rewrites settings.json) whenever Copilot creds already exist, so on a
+# re-install the dynamically reselected port (e.g. 11501 when WSL holds 11500)
+# would otherwise never reach Claude Code, leaving it dialing the stale 11500 and
+# failing with ConnectionRefused once WSL's forwarder goes away. sync-config
+# patches only the base URL + auth token (model/window untouched) and needs no
+# network, so it is safe to run regardless of login state. $env:AI_BRIDGE_PORT is
+# already set by Select-Port, so the child reads the SAME port.
+function Invoke-SyncConfig {
+    param([string]$NodeBin)
+    & $NodeBin $DistEntry sync-config
+    if ($LASTEXITCODE -ne 0) {
+        Write-Warn "could not reconcile ~/.claude/settings.json; set ANTHROPIC_BASE_URL=$BaseUrl there by hand if Claude Code can't connect."
+    }
+}
+
 # =============================================================================
 # uninstall
 # =============================================================================
@@ -632,6 +649,9 @@ Install-ServiceLauncher  -NodeBin $nodeBin
 # empty credential set and answers 401 until restarted, so a later login alone
 # would not recover it.
 Invoke-EnsureLogin       -NodeBin $nodeBin
+# Reconcile settings.json's base URL with $Port AFTER login. Unconditional by
+# design: login is skipped when creds exist, but the port must sync every time.
+Invoke-SyncConfig        -NodeBin $nodeBin
 Install-Task
 
 Write-Host ""
