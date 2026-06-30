@@ -94,6 +94,45 @@ test("assistant tool_use -> tool_calls with JSON-string arguments", () => {
   ]);
 });
 
+test("tool_result + trailing text -> tool messages first, text after (pairing preserved)", () => {
+  // Claude Code's common final-turn shape: answer the tools, then append a
+  // "respond with text only" instruction in the SAME user message. The text
+  // must NOT be emitted between the assistant tool_calls and the tool results,
+  // or Copilot rejects the turn with "`tool_use` ids without `tool_result`
+  // blocks immediately after" (observed as a flood of 400s).
+  const out = mapMessages([
+    {
+      role: "assistant",
+      content: [
+        { type: "text", text: "calling" },
+        { type: "tool_use", id: "call_1", name: "f", input: {} },
+        { type: "tool_use", id: "call_2", name: "g", input: {} },
+      ],
+    },
+    {
+      role: "user",
+      content: [
+        { type: "tool_result", tool_use_id: "call_1", content: "r1" },
+        { type: "tool_result", tool_use_id: "call_2", content: "r2" },
+        { type: "text", text: "now respond with text only" },
+      ],
+    },
+  ]);
+  assert.deepEqual(out, [
+    {
+      role: "assistant",
+      content: "calling",
+      tool_calls: [
+        { id: "call_1", type: "function", function: { name: "f", arguments: "{}" } },
+        { id: "call_2", type: "function", function: { name: "g", arguments: "{}" } },
+      ],
+    },
+    { role: "tool", tool_call_id: "call_1", content: "r1" },
+    { role: "tool", tool_call_id: "call_2", content: "r2" },
+    { role: "user", content: "now respond with text only" },
+  ]);
+});
+
 test("each tool_result -> own tool message paired by tool_call_id", () => {
   const out = mapMessages([
     {

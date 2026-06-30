@@ -256,7 +256,7 @@ export function mapMessages(messages: AnthropicMessage[]): OpenAIMessage[] {
     const media: OpenAIImagePart[] = []; // images + documents, kept not skipped
     const thinking: (OpenAIThinkingPart | OpenAIRedactedThinkingPart)[] = [];
     const toolCalls: OpenAIToolCall[] = [];
-    const trailing: OpenAIMessage[] = []; // tool messages emit after the parent
+    const toolResults: OpenAIMessage[] = []; // emitted before the parent (see below)
 
     for (const block of msg.content) {
       if (block.type === "text") {
@@ -274,7 +274,7 @@ export function mapMessages(messages: AnthropicMessage[]): OpenAIMessage[] {
           function: { name: block.name, arguments: JSON.stringify(block.input ?? {}) },
         });
       } else if (block.type === "tool_result") {
-        trailing.push({
+        toolResults.push({
           role: "tool",
           tool_call_id: block.tool_use_id,
           content: toolResultText(block.content),
@@ -291,10 +291,17 @@ export function mapMessages(messages: AnthropicMessage[]): OpenAIMessage[] {
     } else {
       content = text.length ? text.join("\n") : null;
     }
+    // Tool results must come FIRST, so they sit immediately after the previous
+    // assistant turn's tool_calls. OpenAI (and Copilot's Anthropic re-mapping)
+    // reject a tool_use whose tool_result doesn't immediately follow — emitting
+    // the parent (e.g. sibling text in the same Anthropic user turn) before the
+    // tool messages splits that pairing and triggers a 400. Anthropic already
+    // requires tool_result blocks at the START of a user turn, so any companion
+    // text/media is logically a follow-up and is emitted AFTER the tool results.
+    out.push(...toolResults);
     if (content !== null || toolCalls.length) {
       out.push({ role: msg.role, content, ...(toolCalls.length ? { tool_calls: toolCalls } : {}) });
     }
-    out.push(...trailing);
   }
 
   return out;
