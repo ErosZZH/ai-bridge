@@ -29,6 +29,14 @@ export type Config = {
   baseUrl: string;
 };
 
+// Build the base URL clients dial for a given host/port. config.baseUrl reflects
+// the *configured* port; once the server binds (and may have hopped to a free
+// port), the entrypoint rebuilds the URL from the *actual* port with this so
+// ANTHROPIC_BASE_URL tracks the real bind rather than the pre-probe guess.
+export function makeBaseUrl(host: string, port: number): string {
+  return `http://${host}:${port}`;
+}
+
 export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
   const parsed = EnvSchema.parse(env);
   return {
@@ -37,6 +45,6 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
     logDir: parsed.AI_BRIDGE_LOG_DIR,
     logLevel: parsed.AI_BRIDGE_LOG_LEVEL,
     logMaxFiles: parsed.AI_BRIDGE_LOG_MAX_FILES,
-    baseUrl: `http://${parsed.AI_BRIDGE_HOST}:${parsed.AI_BRIDGE_PORT}`,
+    baseUrl: makeBaseUrl(parsed.AI_BRIDGE_HOST, parsed.AI_BRIDGE_PORT),
   };
 }

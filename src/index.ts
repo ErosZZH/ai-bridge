@@ -1,7 +1,5 @@
 import { createInterface } from "node:readline/promises";
 
-import { serve } from "@hono/node-server";
-
 import { getCopilotToken, getGitHubToken, loginWithDeviceFlow } from "./auth/index.js";
 import {
   AUTH_TOKEN_VALUE,
@@ -10,10 +8,11 @@ import {
   withClaudeCode1mSuffix,
   writeClaudeSettings,
 } from "./claude-config.js";
-import { loadConfig } from "./config.js";
+import { loadConfig, makeBaseUrl } from "./config.js";
 import { getModels, resolveModel } from "./copilot/models.js";
 import { Logger, ensureLogDir, pruneOldLogs } from "./obs/index.js";
 import { createServer } from "./server/index.js";
+import { listenWithFallback } from "./server/listen.js";
 
 // `ai-bridge login` runs the interactive GitHub device flow, writes the default
 // model + connection config into ~/.claude/settings.json, and exits without
@@ -120,12 +119,43 @@ async function main() {
 
   const app = createServer(config, logger);
 
-  serve({ fetch: app.fetch, hostname: config.host, port: config.port }, () => {
-    logger.info(`listening on ${config.baseUrl}`);
-    logger.info(`logs: ${config.logDir}`);
-    logger.info("Claude Code config lives in ~/.claude/settings.json");
-    logger.info("  run `ai-bridge login` to wire it, or `ai-bridge model` to change model");
-  });
+  // Bind the port the server can ACTUALLY hold right now, scanning forward from
+  // the configured one. The installer pre-probes a free port too, but that check
+  // can go stale before the Scheduled Task binds at logon (e.g. a WSL guest grabs
+  // it in between) — only the live listen() result is authoritative.
+  const startPort = config.port;
+  const { port } = await listenWithFallback(
+    app.fetch,
+    config.host,
+    startPort,
+    50,
+    (busy) => logger.info(`port ${busy} in use; trying ${busy + 1}`),
+  );
+
+  // Pin config to what we actually bound, so every downstream reader of
+  // config.baseUrl/config.port (e.g. the /health route) reports the live port
+  // rather than the configured guess.
+  config.port = port;
+  config.baseUrl = makeBaseUrl(config.host, port);
+
+  // Reconcile ~/.claude/settings.json to the port we actually bound, so Claude
+  // Code's ANTHROPIC_BASE_URL always matches the live server — this is what
+  // closes the ConnectionRefused drift when the bound port differs from the one
+  // the installer wrote. Connection keys only; model/window are left untouched.
+  // Best-effort: a settings write failure must not take the server down.
+  try {
+    const settingsPath = syncClaudeConnection({ baseUrl: config.baseUrl, authToken: AUTH_TOKEN_VALUE });
+    if (port !== startPort) {
+      logger.info(`bound port ${port} != configured ${startPort}; rewrote ${settingsPath} -> ${config.baseUrl}`);
+    }
+  } catch (err) {
+    logger.error(`could not reconcile ~/.claude/settings.json: ${(err as Error).message}`);
+  }
+
+  logger.info(`listening on ${config.baseUrl}`);
+  logger.info(`logs: ${config.logDir}`);
+  logger.info("Claude Code config lives in ~/.claude/settings.json");
+  logger.info("  run `ai-bridge login` to wire it, or `ai-bridge model` to change model");
 }
 
 const command = process.argv[2];
