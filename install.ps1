@@ -46,6 +46,19 @@ $BinDir    = Join-Path $env:LOCALAPPDATA 'ai-bridge\bin'
 $Wrapper   = Join-Path $BinDir 'ai-bridge.cmd'
 $ServiceLauncher = Join-Path $BinDir 'ai-bridge-service.cmd'
 
+# Port selection. A single AI_BRIDGE_PORT feeds both the server bind and the
+# ANTHROPIC_BASE_URL written into ~/.claude/settings.json, so the two must agree.
+# Probe for a free port at install time: when a Windows host and its WSL guest
+# both install ai-bridge they share localhost, and both defaulting to 11500 makes
+# one server lose the bind -- Claude Code, pointed at that dead base URL, then
+# fails with an opaque 400. DefaultPort is the starting point (overridable via
+# $env:AI_BRIDGE_PORT); $Port is the winner chosen by Select-Port.
+$DefaultPort  = if ($env:AI_BRIDGE_PORT) { [int]$env:AI_BRIDGE_PORT } else { 11500 }
+$PortScanLimit = 50
+$BindHost     = if ($env:AI_BRIDGE_HOST) { $env:AI_BRIDGE_HOST } else { '127.0.0.1' }
+$Port         = $null
+$BaseUrl      = $null
+
 function Write-Info { param([string]$Msg) Write-Host "==> $Msg" -ForegroundColor Cyan }
 function Write-Warn { param([string]$Msg) Write-Host "warning: $Msg" -ForegroundColor Yellow }
 
@@ -89,6 +102,68 @@ function Invoke-DetectProxy {
         Write-Info "no proxy detected in env; service will connect directly"
         Write-Warn "if Copilot withholds models (e.g. Claude) without a proxy, re-run with:`n    `$env:AI_BRIDGE_PROXY='http://host:port'; .\install.ps1"
     }
+}
+
+# --- port selection ----------------------------------------------------------
+# True if $BindHost:$Port is free to bind. We probe with node's net.createServer
+# (the same runtime the server binds with) rather than Test-NetConnection or a
+# raw socket: only an actual listen() reflects the bind semantics
+# @hono/node-server uses, and node is already a hard dependency here.
+# exclusive:true rejects any SO_REUSEADDR-style shared bind so a port another
+# instance already holds reads as taken.
+function Test-PortFree {
+    param([string]$NodeBin, [int]$Port)
+    # Single-quoted JS on ONE line. Windows PowerShell 5.1 -- which this installer
+    # relaunches via powershell.exe for elevation, and which most Windows users run
+    # -- does NOT escape embedded double quotes when handing an argument to a native
+    # exe, so double-quoted JS would reach node as require(net) -> ReferenceError ->
+    # exit 1 for every port. Keeping the probe free of double quotes (and on one
+    # line) sidesteps that quoting bug. Single quotes inside a single-quoted
+    # here-string are literal, so they survive to node intact.
+    $probe = @'
+const net=require('net');const s=net.createServer();s.once('error',()=>process.exit(1));s.listen({host:process.env.AI_BRIDGE_PROBE_HOST,port:Number(process.env.AI_BRIDGE_PROBE_PORT),exclusive:true},()=>s.close(()=>process.exit(0)));
+'@
+    $env:AI_BRIDGE_PROBE_HOST = $BindHost
+    $env:AI_BRIDGE_PROBE_PORT = "$Port"
+    try {
+        & $NodeBin -e $probe 2>$null
+        return ($LASTEXITCODE -eq 0)
+    } catch {
+        # PS 7.4+ defaults $PSNativeCommandUseErrorActionPreference=$true, so with
+        # $ErrorActionPreference='Stop' (top of script) a busy port (node exit 1)
+        # raises a TERMINATING error instead of just returning non-zero. Without
+        # this catch the first occupied port would abort the whole install -- the
+        # exact Windows+WSL-both-on-11500 collision this feature exists to handle.
+        return $false
+    } finally {
+        Remove-Item Env:AI_BRIDGE_PROBE_HOST -ErrorAction SilentlyContinue
+        Remove-Item Env:AI_BRIDGE_PROBE_PORT -ErrorAction SilentlyContinue
+    }
+}
+
+# Pick the first free port at/after $DefaultPort and publish it as $Port/$BaseUrl
+# plus $env:AI_BRIDGE_PORT, so the service launcher, the CLI wrapper, and the
+# pre-start login all read the SAME port. Without this, a Windows host and its
+# WSL guest both default to 11500; the loser of the bind leaves Claude Code
+# pointed at a dead base URL, which surfaces as an opaque 400.
+function Select-Port {
+    param([string]$NodeBin)
+    $limit = $DefaultPort + $PortScanLimit
+    for ($candidate = $DefaultPort; $candidate -lt $limit; $candidate++) {
+        if (Test-PortFree -NodeBin $NodeBin -Port $candidate) {
+            $script:Port    = $candidate
+            $script:BaseUrl = "http://${BindHost}:${candidate}"
+            $env:AI_BRIDGE_PORT = "$candidate"
+            if ($candidate -eq $DefaultPort) {
+                Write-Info "port $candidate is free -- using it"
+            } else {
+                Write-Info "port $DefaultPort is in use; selected free port $candidate instead"
+            }
+            return
+        }
+        Write-Info "port $candidate is in use; trying $($candidate + 1)"
+    }
+    throw "no free port found in range $DefaultPort-$($limit - 1). Free one up or set `$env:AI_BRIDGE_PORT to an open port and re-run."
 }
 
 # =============================================================================
@@ -365,6 +440,7 @@ function Install-Wrapper {
     New-Item -ItemType Directory -Force -Path $BinDir | Out-Null
     $cmd = @"
 @echo off
+if not defined AI_BRIDGE_PORT set "AI_BRIDGE_PORT=$Port"
 "$NodeBin" "$DistEntry" %*
 "@
     # ASCII, no BOM -- cmd.exe chokes on a UTF-8 BOM at the top of a .cmd.
@@ -403,6 +479,7 @@ set "NO_PROXY=$NoProxyVal"
     $cmd = @"
 @echo off
 set "NODE_ENV=production"
+set "AI_BRIDGE_PORT=$Port"
 $proxyLines
 "$NodeBin" "$DistEntry" %*
 "@
@@ -546,6 +623,9 @@ if ($UnregisterTaskOnly) {
 $nodeBin = Invoke-Preflight
 Invoke-Build -NodeBin $nodeBin
 Invoke-DetectProxy
+# Choose a free port BEFORE writing the wrapper, service launcher, or login config
+# -- they all bake in $Port (via $env:AI_BRIDGE_PORT), so it must be settled first.
+Select-Port              -NodeBin $nodeBin
 Install-Wrapper          -NodeBin $nodeBin
 Install-ServiceLauncher  -NodeBin $nodeBin
 # Sign in before registering the task. A task started without creds caches the
@@ -555,7 +635,7 @@ Invoke-EnsureLogin       -NodeBin $nodeBin
 Install-Task
 
 Write-Host ""
-Write-Info "ai-bridge installed and running at http://127.0.0.1:11500"
+Write-Info "ai-bridge installed and running at $BaseUrl"
 
 Write-Host @"
 
