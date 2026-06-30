@@ -436,6 +436,17 @@ then re-run this installer:  https://visualstudio.microsoft.com/visual-cpp-build
     try {
         & $NodeBin scripts/vcpkg-setup.js
         if ($LASTEXITCODE -ne 0) { throw "node-libcurl vcpkg setup failed (curl source build)" }
+
+        # A malformed persistent VCINSTALLDIR/VSINSTALLDIR (e.g. pointing at
+        # "...\Visual Studio\2022" without the edition segment) makes node-gyp
+        # think it's in a VS Command Prompt and reject the real VS install with
+        # "does not match this Visual Studio Command Prompt". Clear them for this
+        # process so node-gyp falls back to normal auto-detection, and pin the
+        # version explicitly (a VS 18 preview install confuses node-gyp's parser).
+        Remove-Item Env:VCINSTALLDIR -ErrorAction SilentlyContinue
+        Remove-Item Env:VSINSTALLDIR -ErrorAction SilentlyContinue
+        $env:GYP_MSVS_VERSION = '2022'
+
         & npx node-pre-gyp configure build
         if ($LASTEXITCODE -ne 0) { throw "node-libcurl native addon build failed" }
     } finally {
