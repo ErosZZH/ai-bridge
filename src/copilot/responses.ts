@@ -1,5 +1,5 @@
 // Copilot HTTP client for the **Responses API** (/responses), the sibling of
-// index.ts's /chat/completions client. Same transport (curlFetch — the Copilot
+// index.ts's /chat/completions client. Same transport (copilotFetch — the Copilot
 // edge fingerprint-gates Node's native TLS), same headers, same exchange-once-on
 // -401 retry. The only differences are the path and that the streaming events are
 // the Responses semantic events (response.output_text.delta, response.completed,
@@ -13,7 +13,7 @@ import {
   getCopilotToken,
   reauthCopilotToken,
 } from "../auth/index.js";
-import { curlFetch } from "./curlFetch.js";
+import { copilotFetch } from "./copilotFetch.js";
 import { CopilotRequestError } from "./index.js";
 
 // One parsed `data:` line from the Responses SSE stream. The discriminating
@@ -24,7 +24,7 @@ export type ResponsesStreamEvent = {
   [k: string]: unknown;
 };
 
-let fetchImpl: typeof fetch = curlFetch;
+let fetchImpl: typeof fetch = copilotFetch;
 // Test seam, mirroring __setCopilotDeps. Lets the stream/401 logic be exercised
 // without disk creds or a live endpoint.
 export function __setResponsesDeps(deps: { fetch?: typeof fetch }) {
