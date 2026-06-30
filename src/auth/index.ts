@@ -113,9 +113,23 @@ export function readGitHubToken(): GitHubToken | null {
 
 let cached: GitHubToken[] | undefined;
 
+// Tokens for the next exchange, re-reading disk whenever the cache is empty.
+//
+// An empty cache is never authoritative: the service often starts before the
+// user runs `ai-bridge login` (which writes apps.json), and `getGitHubToken()`
+// at startup would otherwise pin `cached` to `[]` forever. Treating that empty
+// array as final wedges the process into permanent 401s until it is restarted.
+// So we re-read disk on every call while there are no creds — picking up a
+// freshly written token on the next request, no restart needed — and only
+// short-circuit once a populated cache exists (keeping the steady state free of
+// a per-call disk hit).
+function ensureTokens(): GitHubToken[] {
+  if (cached === undefined || cached.length === 0) cached = readTokens();
+  return cached;
+}
+
 export function getGitHubToken(): GitHubToken | null {
-  if (cached === undefined) cached = readTokens();
-  return cached[0] ?? null;
+  return ensureTokens()[0] ?? null;
 }
 
 // Drop the in-memory copies and re-read from disk; used on 401 in case the
@@ -211,10 +225,10 @@ export async function getCopilotToken(): Promise<CopilotToken> {
   if (copilot && isFresh(copilot)) return copilot;
   if (inflight) return inflight;
 
-  if (cached === undefined) cached = readTokens();
-  if (cached.length === 0) throw new CopilotAuthError(SIGN_IN_HINT);
+  const tokens = ensureTokens();
+  if (tokens.length === 0) throw new CopilotAuthError(SIGN_IN_HINT);
 
-  inflight = exchangeAny(cached)
+  inflight = exchangeAny(tokens)
     .then((t) => {
       copilot = t;
       return t;

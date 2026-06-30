@@ -3,8 +3,10 @@ import test from "node:test";
 
 import {
   CopilotAuthError,
+  type GitHubToken,
   __setAuthDeps,
   getCopilotToken,
+  getGitHubToken,
   reauthCopilotToken,
 } from "./index.js";
 
@@ -69,6 +71,29 @@ test("defaults endpoint when none returned", async () => {
 test("missing disk token raises sign-in error", async () => {
   __setAuthDeps({ readTokens: () => [], fetch: async () => jsonResponse({}) });
   await assert.rejects(getCopilotToken(), CopilotAuthError);
+});
+
+test("picks up creds written after startup without a restart", async () => {
+  // Reproduces the wedged-401 bug: the service starts with no creds (so the
+  // cache is an empty array), the user then runs `ai-bridge login` which writes
+  // apps.json, and the very next request must succeed — no process restart, no
+  // explicit reauth call. An empty cache must therefore never be authoritative.
+  let disk: GitHubToken[] = [];
+  __setAuthDeps({
+    readTokens: () => disk,
+    fetch: async () => jsonResponse({ token: "copilot-late", expires_at: FAR_FUTURE }),
+  });
+
+  // Startup probe with nothing on disk pins the cache to [] in the buggy version.
+  assert.equal(getGitHubToken(), null);
+  await assert.rejects(getCopilotToken(), CopilotAuthError);
+
+  // `ai-bridge login` lands a token on disk.
+  disk = [{ token: "oauth-late", user: "rick" }];
+
+  // Next request re-reads disk on its own and exchanges — no restart needed.
+  const t = await getCopilotToken();
+  assert.equal(t.token, "copilot-late");
 });
 
 test("reauth re-reads disk and re-exchanges", async () => {

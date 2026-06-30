@@ -74,6 +74,51 @@ function Invoke-DetectProxy {
 }
 
 # =============================================================================
+# credential detection + pre-start login
+# =============================================================================
+# The service mints short-lived Copilot bearer tokens from a long-lived GitHub
+# oauth_token on disk (apps.json/hosts.json, written by VS Code Copilot, gh, or
+# our own `ai-bridge login`). If that token is absent the service starts but
+# answers 401 to every request — and because it caches the empty credential set
+# at startup, a later `ai-bridge login` won't recover until the task is
+# restarted. So sign in BEFORE registering the task. Mirrors
+# findCopilotConfigDirs()/readGitHubTokens() in src/auth/index.ts (win32 dirs).
+function Test-CopilotCreds {
+    $dirs = @()
+    if ($env:LOCALAPPDATA) { $dirs += (Join-Path $env:LOCALAPPDATA 'github-copilot') }
+    if ($env:APPDATA)      { $dirs += (Join-Path $env:APPDATA 'GitHub Copilot') }
+    foreach ($dir in $dirs) {
+        foreach ($f in @('apps.json', 'hosts.json')) {
+            $path = Join-Path $dir $f
+            if (Test-Path $path) {
+                if (Select-String -Path $path -Pattern '"oauth_token"\s*:\s*"[^"]' -Quiet -ErrorAction SilentlyContinue) {
+                    return $true
+                }
+            }
+        }
+    }
+    return $false
+}
+
+# Sign in before the task starts. Skips when usable creds already exist (the
+# oauth_token is long-lived and the bearer auto-refreshes). Non-fatal: on failure
+# the install continues with a warning.
+function Invoke-EnsureLogin {
+    param([string]$NodeBin)
+    if (Test-CopilotCreds) {
+        Write-Info "GitHub Copilot credentials already present — skipping login"
+        return
+    }
+    Write-Info "no GitHub Copilot credentials found; starting sign-in before the service launches"
+    & $NodeBin $DistEntry login
+    if ($LASTEXITCODE -eq 0) {
+        Write-Info "GitHub Copilot sign-in complete"
+    } else {
+        Write-Warn "sign-in did not complete; the service will start but return 401 until you run ``ai-bridge login`` then restart the task (Stop-ScheduledTask / Start-ScheduledTask -TaskName $TaskName)."
+    }
+}
+
+# =============================================================================
 # uninstall
 # =============================================================================
 function Invoke-Uninstall {
@@ -236,6 +281,10 @@ Invoke-Build
 Invoke-DetectProxy
 Install-Wrapper          -NodeBin $nodeBin
 Install-ServiceLauncher  -NodeBin $nodeBin
+# Sign in before registering the task. A task started without creds caches the
+# empty credential set and answers 401 until restarted, so a later login alone
+# would not recover it.
+Invoke-EnsureLogin       -NodeBin $nodeBin
 Install-Task
 
 Write-Host ""
@@ -243,7 +292,7 @@ Write-Info "ai-bridge installed and running at http://127.0.0.1:11500"
 Write-Host @"
 
 Next steps:
-  1. Sign in to GitHub Copilot:   ai-bridge login
+  1. (optional) re-run sign-in:   ai-bridge login   (only if the service 401s)
   2. (optional) pick a model:     ai-bridge model
   3. Run Claude Code as usual:    claude
 

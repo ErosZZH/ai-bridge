@@ -67,6 +67,51 @@ detect_proxy() {
 }
 
 # =============================================================================
+# credential detection + pre-start login
+# =============================================================================
+# The service mints short-lived Copilot bearer tokens from a long-lived GitHub
+# oauth_token on disk (apps.json/hosts.json, written by VS Code Copilot, gh, or
+# our own `ai-bridge login`). If that token is absent the service starts but
+# answers 401 to every request — and because it caches the empty credential set
+# at startup, a later `ai-bridge login` won't recover until the service is
+# restarted. So sign in BEFORE registering the service. Mirrors
+# findCopilotConfigDirs()/readGitHubTokens() in src/auth/index.ts.
+copilot_creds_present() {
+  local dirs=() dir f path
+  if [ -n "${XDG_CONFIG_HOME:-}" ]; then dirs+=("$XDG_CONFIG_HOME/github-copilot"); fi
+  dirs+=("$HOME/.config/github-copilot")
+  for dir in "${dirs[@]}"; do
+    for f in apps.json hosts.json; do
+      path="$dir/$f"
+      [ -f "$path" ] || continue
+      if grep -Eq '"oauth_token"[[:space:]]*:[[:space:]]*"[^"]' "$path" 2>/dev/null; then
+        return 0
+      fi
+    done
+  done
+  return 1
+}
+
+# Sign in before the service starts. Skips when usable creds already exist (the
+# oauth_token is long-lived and the bearer auto-refreshes). Non-fatal: on failure
+# the install continues with a warning.
+ensure_login() {
+  local node_bin="$1"
+  if copilot_creds_present; then
+    info "GitHub Copilot credentials already present — skipping login"
+    return
+  fi
+  info "no GitHub Copilot credentials found; starting sign-in before the service launches"
+  if "$node_bin" "$DIST_ENTRY" login; then
+    info "GitHub Copilot sign-in complete"
+  else
+    warn "sign-in did not complete; the service will start but return 401 until you run:
+    ai-bridge login
+    then restart the service (see 'Manage the service' below)."
+  fi
+}
+
+# =============================================================================
 # uninstall
 # =============================================================================
 uninstall() {
@@ -269,6 +314,11 @@ main() {
 
   install_wrapper "$node_bin"
 
+  # Sign in before registering the service. A service started without creds
+  # caches the empty credential set and answers 401 until restarted, so a later
+  # login alone would not recover it.
+  ensure_login "$node_bin"
+
   case "$OS" in
     Linux)  install_systemd "$node_bin" ;;
     Darwin) install_launchd "$node_bin" ;;
@@ -280,9 +330,9 @@ main() {
 $(info "ai-bridge installed and running at http://127.0.0.1:11500")
 
 Next steps:
-  1. Sign in to GitHub Copilot:   ai-bridge login
-  2. (optional) pick a model:     ai-bridge model
-  3. Run Claude Code as usual:    claude
+  1. (optional) re-run sign-in:    ai-bridge login   (only if the service 401s)
+  2. (optional) pick a model:      ai-bridge model
+  3. Run Claude Code as usual:     claude
 
 Manage the service:
 EOF
