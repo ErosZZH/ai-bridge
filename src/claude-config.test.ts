@@ -5,10 +5,15 @@ import { join } from "node:path";
 import test from "node:test";
 
 import {
+  DEFAULT_MODEL,
   claudeSettingsPath,
   withClaudeCode1mSuffix,
   writeClaudeSettings,
 } from "./claude-config.js";
+
+test("default model matches the Copilot catalog id for Opus 4.8", () => {
+  assert.equal(DEFAULT_MODEL, "claude-opus-4.8");
+});
 
 test("withClaudeCode1mSuffix tags only in-band windows", () => {
   // in band (800K, 1.5M) -> suffix added

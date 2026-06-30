@@ -6,6 +6,7 @@ import { getCopilotToken, getGitHubToken, loginWithDeviceFlow } from "./auth/ind
 import {
   AUTH_TOKEN_VALUE,
   DEFAULT_MODEL,
+  withClaudeCode1mSuffix,
   writeClaudeSettings,
 } from "./claude-config.js";
 import { loadConfig } from "./config.js";
@@ -32,7 +33,7 @@ async function login() {
   });
 
   console.log(`Signed in as ${token.user}.`);
-  console.log(`Wrote ${path} (model: ${DEFAULT_MODEL}).`);
+  console.log(`Wrote ${path} (model: ${withClaudeCode1mSuffix(DEFAULT_MODEL, info?.maxPromptTokens || info?.maxContextWindowTokens)}).`);
   console.log("Run `ai-bridge model` to choose a different model, or start the bridge with no arguments.");
 }
 
