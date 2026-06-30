@@ -611,6 +611,87 @@ function Install-Task {
 }
 
 # =============================================================================
+# autostart verification + per-user fallback
+# =============================================================================
+# A Scheduled Task can report success yet never actually run: on locked-down
+# domain machines the S4U logon type ("run whether logged on or not") is often
+# blocked by policy, so Register/Start both succeed but no process ever spawns and
+# no log is written. The only honest test is whether the bridge answers on its
+# port, so we probe /health and, if it's dead, switch to an autostart that needs
+# neither admin nor an S4U token.
+
+# Poll $BaseUrl/health until it answers ok or we time out. True only when the
+# service is genuinely reachable -- the real proof the autostart worked.
+function Test-BridgeUp {
+    param([int]$TimeoutSec = 8)
+    $deadline = (Get-Date).AddSeconds($TimeoutSec)
+    while ((Get-Date) -lt $deadline) {
+        try {
+            $r = Invoke-RestMethod "$BaseUrl/health" -TimeoutSec 2
+            if ($r.status -eq 'ok') { return $true }
+        } catch {
+            Start-Sleep -Milliseconds 500
+        }
+    }
+    return $false
+}
+
+# Per-user logon autostart: an HKCU\...\Run entry launching the hidden service
+# launcher via cmd's `start "" /b` (detached, no console window). Needs no admin
+# and no S4U token, so it runs in the interactive session where the Scheduled Task
+# silently won't. The uninstall path already removes this key (same $TaskName).
+function Install-RunFallback {
+    $runKey = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Run'
+    $value = 'cmd /c start "" /b "' + $ServiceLauncher + '"'
+    Set-ItemProperty -Path $runKey -Name $TaskName -Value $value
+    Write-Info "installed per-user logon autostart (HKCU\...\Run\$TaskName)"
+}
+
+# Remove the HKCU Run fallback if present. Called when the Scheduled Task path is
+# verified working, so the two mechanisms never both fire at logon (a double start
+# would make the second instance hop to the next port and rewrite settings.json).
+function Remove-RunFallback {
+    $runKey = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Run'
+    if (Get-ItemProperty -Path $runKey -Name $TaskName -ErrorAction SilentlyContinue) {
+        Remove-ItemProperty -Path $runKey -Name $TaskName -ErrorAction SilentlyContinue
+        Write-Info "removed stale per-user autostart (Scheduled Task is handling startup)"
+    }
+}
+
+# Start the bridge now, detached and hidden, so the user need not log out/in for
+# the Run entry to take effect.
+function Start-BridgeDetached {
+    Start-Process -FilePath $ServiceLauncher -WindowStyle Hidden -WorkingDirectory $RepoDir
+}
+
+# Register the Scheduled Task, then PROVE the bridge is reachable; fall back to the
+# per-user Run autostart whenever it isn't. Never aborts the install over an
+# autostart failure -- on a locked-down machine the task may throw (UAC declined)
+# or register-but-never-run, and in both cases the fallback is what makes the
+# bridge actually work. Returns nothing; leaves exactly one autostart active.
+function Install-AutostartVerified {
+    try {
+        Install-Task
+    } catch {
+        Write-Warn "Scheduled Task setup failed: $($_.Exception.Message.Trim())"
+    }
+
+    if (Test-BridgeUp) {
+        Remove-RunFallback
+        return
+    }
+
+    Write-Warn "the service did not come up via the Scheduled Task (common on domain machines where S4U is blocked); falling back to a per-user logon autostart."
+    Install-RunFallback
+    Start-BridgeDetached
+    if (Test-BridgeUp) {
+        Write-Info "ai-bridge is now running via the per-user autostart."
+    } else {
+        Write-Warn "ai-bridge still isn't answering on $BaseUrl -- check %USERPROFILE%\.ai-bridge\logs for the startup error."
+    }
+}
+
+# =============================================================================
 # main
 # =============================================================================
 if ($Uninstall) {
@@ -663,7 +744,10 @@ Invoke-EnsureLogin       -NodeBin $nodeBin
 # Reconcile settings.json's base URL with $Port AFTER login. Unconditional by
 # design: login is skipped when creds exist, but the port must sync every time.
 Invoke-SyncConfig        -NodeBin $nodeBin
-Install-Task
+# Register the Scheduled Task, then verify the bridge actually answers -- falling
+# back to a per-user logon autostart when the task registers but never runs (the
+# silent S4U failure on locked-down domain machines).
+Install-AutostartVerified
 
 Write-Host ""
 Write-Info "ai-bridge installed and running at $BaseUrl"
