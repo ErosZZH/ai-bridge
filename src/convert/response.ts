@@ -95,7 +95,41 @@ export type AnthropicRespToolUseBlock = {
   name: string;
   input: unknown;
 };
-export type AnthropicResponseBlock = AnthropicRespTextBlock | AnthropicRespToolUseBlock;
+
+// Server-side tool blocks (web_search). The bridge synthesizes these in
+// src/search/websearch.ts to reproduce Anthropic's web_search server tool, which
+// Copilot has no equivalent for. The chat/responses mappers never emit them —
+// these are here so the search module and the streaming event types below share
+// one typed vocabulary.
+export type AnthropicRespServerToolUseBlock = {
+  type: "server_tool_use";
+  id: string;
+  name: "web_search";
+  input: { query: string; allowed_domains?: string[]; blocked_domains?: string[] };
+};
+// One web search hit. title+url are what the harness reads; encrypted_content and
+// page_age ride along for fidelity with the real API shape (opaque locally).
+export type WebSearchResultItem = {
+  type: "web_search_result";
+  title: string;
+  url: string;
+  encrypted_content: string;
+  page_age: string | null;
+};
+export type WebSearchToolResultError = {
+  type: "web_search_tool_result_error";
+  error_code: string;
+};
+export type AnthropicRespWebSearchToolResultBlock = {
+  type: "web_search_tool_result";
+  tool_use_id: string;
+  content: WebSearchResultItem[] | WebSearchToolResultError;
+};
+export type AnthropicResponseBlock =
+  | AnthropicRespTextBlock
+  | AnthropicRespToolUseBlock
+  | AnthropicRespServerToolUseBlock
+  | AnthropicRespWebSearchToolResultBlock;
 
 // The harness's usage object. input/cache counts land here from Copilot's
 // prompt_tokens(+details); output_tokens from completion_tokens. The harness
@@ -140,7 +174,22 @@ export type ContentBlockStartEvent = {
   index: number;
   content_block:
     | { type: "text"; text: "" }
-    | { type: "tool_use"; id: string; name: string; input: Record<string, never> };
+    | { type: "tool_use"; id: string; name: string; input: Record<string, never> }
+    // Server-tool blocks the search module streams. server_tool_use opens with an
+    // empty input (filled by input_json_delta, like a normal tool_use);
+    // web_search_tool_result carries its content array INLINE on the start event
+    // (never via deltas) — the harness reads content_block.content directly.
+    | {
+        type: "server_tool_use";
+        id: string;
+        name: "web_search";
+        input: Record<string, never>;
+      }
+    | {
+        type: "web_search_tool_result";
+        tool_use_id: string;
+        content: WebSearchResultItem[] | WebSearchToolResultError;
+      };
 };
 
 export type ContentBlockDeltaEvent = {

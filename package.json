@@ -23,6 +23,7 @@
     "gpt-tokenizer": "^3.4.0",
     "hono": "^4.8.9",
     "node-libcurl": "^5.1.2",
+    "playwright-core": "^1.49.0",
     "zod": "^4.0.10"
   },
   "devDependencies": {

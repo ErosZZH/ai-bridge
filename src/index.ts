@@ -11,6 +11,7 @@ import {
 import { loadConfig, makeBaseUrl } from "./config.js";
 import { getModels, resolveModel } from "./copilot/models.js";
 import { Logger, ensureLogDir, pruneOldLogs } from "./obs/index.js";
+import { teardownBrowser } from "./search/ddg.js";
 import { createServer } from "./server/index.js";
 import { listenWithFallback } from "./server/listen.js";
 
@@ -156,6 +157,15 @@ async function main() {
   logger.info(`logs: ${config.logDir}`);
   logger.info("Claude Code config lives in ~/.claude/settings.json");
   logger.info("  run `ai-bridge login` to wire it, or `ai-bridge model` to change model");
+
+  // Reclaim the headless search browser on shutdown so a stopped/restarted
+  // service never leaves an orphaned Chrome behind. Best-effort and idempotent.
+  const shutdown = () => {
+    void teardownBrowser();
+  };
+  process.once("SIGTERM", shutdown);
+  process.once("SIGINT", shutdown);
+  process.once("beforeExit", shutdown);
 }
 
 const command = process.argv[2];

@@ -32,6 +32,12 @@ import {
 } from "../../copilot/index.js";
 import { responsesCompletion, streamResponsesCompletion } from "../../copilot/responses.js";
 import { type ModelInfo, resolveModel } from "../../copilot/models.js";
+import {
+  findWebSearchTool,
+  runAndStreamWebSearch,
+  runWebSearchLoop,
+  toAnthropicResponse,
+} from "../../search/websearch.js";
 import { writeCapture } from "../../obs/capture.js";
 import type { RequestVars } from "../index.js";
 import { type AnthropicErrorType, anthropicError, isContextLengthError } from "../errors.js";
@@ -150,6 +156,53 @@ async function handleMessages(c: Ctx): Promise<Response> {
   const body = withResolvedModel(withDefaultBudget(raw, info), info);
   const signal = c.req.raw.signal;
   const scope: ErrorScope = { endpoint: "/v1/messages", model: body.model, request: raw };
+
+  // WebSearch emulation. Claude Code's web_search is an Anthropic server-side
+  // tool that Copilot can't run; when present we intercept it and execute the
+  // searches locally (src/search/), synthesizing the server_tool_use +
+  // web_search_tool_result blocks the harness expects. When disabled or absent,
+  // fall through to the normal completion paths untouched.
+  const config = c.get("config");
+  if (config.search.enabled && findWebSearchTool(body.tools)) {
+    const endpoint: "chat" | "responses" = info?.endpoint === "responses" ? "responses" : "chat";
+    scope.upstreamRequest = { note: "web_search emulation", endpoint };
+    const searchArgs = { inbound: body, endpoint, config: config.search, signal, logger };
+    if (body.stream) {
+      return streamSSE(
+        c,
+        async (sse) => {
+          try {
+            for await (const event of runAndStreamWebSearch(searchArgs)) {
+              if (signal.aborted) break;
+              await sse.writeSSE({ event: event.type, data: JSON.stringify(event) });
+            }
+            logger.info("/v1/messages (web_search stream) done", { model: body.model, status: 200 });
+          } catch (err) {
+            if (signal.aborted) return;
+            await writeErrorEvent(c, sse, err, scope);
+          }
+        },
+        async (err, sse) => {
+          if (signal.aborted) return;
+          await writeErrorEvent(c, sse, err, scope);
+        },
+      );
+    }
+    try {
+      const outcome = await runWebSearchLoop(searchArgs);
+      const mapped = toAnthropicResponse(outcome);
+      logger.info("/v1/messages (web_search)", {
+        model: mapped.model,
+        searches: outcome.searches,
+        in: mapped.usage.input_tokens,
+        out: mapped.usage.output_tokens,
+        status: 200,
+      });
+      return c.json(mapped);
+    } catch (err) {
+      return errorResponse(c, err, scope);
+    }
+  }
 
   // Newest OpenAI models are reachable only via the Responses API; everything
   // else (and `auto`) takes the chat/completions path.

@@ -10,6 +10,8 @@ import { __setCopilotDeps, chatCompletion } from "../../copilot/index.js";
 import { __setResponsesDeps } from "../../copilot/responses.js";
 import { __resetModelsCache, __setModelsDeps } from "../../copilot/models.js";
 import { __setResponseDeps } from "../../convert/index.js";
+import { __setSearchDeps } from "../../search/ddg.js";
+import { __setSearchIdDep } from "../../search/websearch.js";
 import { loadConfig } from "../../config.js";
 import { Logger } from "../../obs/index.js";
 import { createServer } from "../index.js";
@@ -755,4 +757,109 @@ test("POST /v1/messages tears down the upstream call when the client disconnects
   ac.abort(); // client goes away mid-flight
   await assert.rejects(call, (e: Error) => e.name === "AbortError");
   assert.equal(upstreamSawAbort, true, "the upstream fetch should have seen the abort signal");
+});
+
+// A scripted Copilot for the web_search route branch: first call asks to search,
+// second call writes the final answer. Records nothing; the route drives it.
+function webSearchChatFetch(query: string) {
+  let n = 0;
+  return (async () => {
+    n++;
+    if (n === 1) {
+      return json({
+        id: "cc",
+        model: "gpt-4o",
+        choices: [
+          {
+            index: 0,
+            message: {
+              role: "assistant",
+              content: null,
+              tool_calls: [
+                { id: "call_1", type: "function", function: { name: "web_search", arguments: JSON.stringify({ query }) } },
+              ],
+            },
+            finish_reason: "tool_calls",
+          },
+        ],
+        usage: { prompt_tokens: 20, completion_tokens: 5, total_tokens: 25 },
+      });
+    }
+    return json({
+      id: "cc",
+      model: "gpt-4o",
+      choices: [{ index: 0, message: { role: "assistant", content: "Answer.\n\nSources:\n- [R1](https://ex1.com/)" }, finish_reason: "stop" }],
+      usage: { prompt_tokens: 30, completion_tokens: 6, total_tokens: 36 },
+    });
+  }) as unknown as typeof fetch;
+}
+
+test("POST /v1/messages executes web_search server tool locally (non-stream)", async () => {
+  __setSearchIdDep(() => "srvtoolu_x");
+  __setSearchDeps({ search: async () => [{ title: "R1", url: "https://ex1.com/" }] });
+  const server = app(webSearchChatFetch("latest ts release"));
+
+  const res = await post(server, "/v1/messages", {
+    model: "gpt-4o",
+    max_tokens: 128,
+    tools: [{ type: "web_search_20250305", name: "web_search", max_uses: 8 }],
+    messages: [{ role: "user", content: "Perform a web search for the query: latest ts release" }],
+  });
+  assert.equal(res.status, 200);
+  const body = (await res.json()) as { content: Record<string, unknown>[] };
+  assert.deepEqual(
+    body.content.map((b) => b.type),
+    ["server_tool_use", "web_search_tool_result", "text"],
+  );
+  const stu = body.content[0] as unknown as { id: string };
+  const wstr = body.content[1] as unknown as { tool_use_id: string; content: { title: string; url: string }[] };
+  assert.equal(stu.id, "srvtoolu_x");
+  assert.equal(wstr.tool_use_id, "srvtoolu_x");
+  assert.equal(wstr.content[0].url, "https://ex1.com/");
+});
+
+test("POST /v1/messages web_search streams the server-tool block lifecycle", async () => {
+  __setSearchIdDep(() => "srvtoolu_y");
+  __setSearchDeps({ search: async () => [{ title: "R1", url: "https://ex1.com/" }] });
+  const server = app(webSearchChatFetch("q"));
+
+  const res = await post(server, "/v1/messages", {
+    model: "gpt-4o",
+    max_tokens: 128,
+    stream: true,
+    tools: [{ type: "web_search_20250305", name: "web_search", max_uses: 8 }],
+    messages: [{ role: "user", content: "Perform a web search for the query: q" }],
+  });
+  assert.equal(res.status, 200);
+  const text = await res.text();
+  const events = [...text.matchAll(/^event: (.+)$/gm)].map((m) => m[1]);
+  assert.equal(events[0], "message_start");
+  assert.ok(events.includes("content_block_start"));
+  assert.equal(events.at(-1), "message_stop");
+  // The synthesized result block carries its content inline on the start event.
+  assert.match(text, /"type":"web_search_tool_result"/);
+  assert.match(text, /"tool_use_id":"srvtoolu_y"/);
+  assert.match(text, /"url":"https:\/\/ex1\.com\/"/);
+});
+
+test("POST /v1/messages leaves requests without web_search untouched", async () => {
+  let searched = false;
+  __setSearchDeps({ search: async () => { searched = true; return []; } });
+  const server = app(async () =>
+    json({
+      id: "cc",
+      model: "gpt-4o",
+      choices: [{ index: 0, message: { role: "assistant", content: "plain" }, finish_reason: "stop" }],
+      usage: { prompt_tokens: 3, completion_tokens: 1, total_tokens: 4 },
+    }),
+  );
+  const res = await post(server, "/v1/messages", {
+    model: "gpt-4o",
+    max_tokens: 32,
+    messages: [{ role: "user", content: "hi" }],
+  });
+  assert.equal(res.status, 200);
+  const body = (await res.json()) as { content: { type: string; text?: string }[] };
+  assert.deepEqual(body.content, [{ type: "text", text: "plain" }]);
+  assert.equal(searched, false);
 });

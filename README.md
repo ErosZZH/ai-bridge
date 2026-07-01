@@ -106,8 +106,34 @@ Set these in the `env` block of `~/.claude/settings.json` (or as real environmen
 | `AI_BRIDGE_LOG_DIR` | `~/.ai-bridge/logs` | Log directory |
 | `AI_BRIDGE_LOG_LEVEL` | `info` | `debug` \| `info` \| `error` (`debug` logs full bodies) |
 | `AI_BRIDGE_LOG_MAX_FILES` | `20` | Rolling log files to keep before pruning |
+| `AI_BRIDGE_SEARCH_ENABLED` | `1` | Enable WebSearch support (`0`/`false` disables) |
+| `AI_BRIDGE_SEARCH_MAX_RESULTS` | `8` | Max results returned per search |
+| `AI_BRIDGE_SEARCH_MAX_USES` | `8` | Max searches per WebSearch call |
+| `AI_BRIDGE_SEARCH_IDLE_MS` | `30000` | Idle time before the search browser is torn down |
+| `AI_BRIDGE_SEARCH_NAV_TIMEOUT_MS` | `15000` | Per-search page navigation timeout |
+| `AI_BRIDGE_SEARCH_PROXY` | *(shared proxy)* | Proxy for search only; defaults to the service proxy, `none` forces direct |
 
 > If you change `AI_BRIDGE_PORT` / `AI_BRIDGE_HOST`, re-run `ai-bridge login` (or `model`) so `ANTHROPIC_BASE_URL` is rewritten to match.
+
+## WebSearch
+
+Claude Code's **WebSearch** tool is an Anthropic *server-side* tool: the harness expects the
+backend to run the searches and return the results inline. Copilot's API has no equivalent, so
+the bridge runs the search itself. It intercepts the tool, drives a Copilot tool-loop to reproduce
+Anthropic's search behavior, and executes each query against **DuckDuckGo** using a headless
+**Google Chrome** (via `playwright-core`, driving your system-installed Chrome — no browser is
+downloaded). Results are returned as the exact `server_tool_use` / `web_search_tool_result` blocks
+Claude Code expects, so answers still end with a **Sources:** section.
+
+- **No API key required.** Search runs through your existing Chrome install.
+- **Proxy-aware.** Search reuses the same proxy the service already routes through (the installer
+  bakes `HTTPS_PROXY`/`HTTP_PROXY` into the unit; override search alone with `AI_BRIDGE_SEARCH_PROXY`,
+  or set it to `none` for a direct connection). Machines without a proxy connect directly.
+- **Lightweight.** The browser launches lazily on the first search, is reused across the searches in
+  a call, and is torn down after `AI_BRIDGE_SEARCH_IDLE_MS` of inactivity.
+- Requires Google Chrome on the machine. If Chrome can't launch, the search returns an error result
+  and Claude Code still answers (without sources) rather than failing the request. Set
+  `AI_BRIDGE_SEARCH_ENABLED=0` to disable interception entirely.
 
 ## Uninstall
 
