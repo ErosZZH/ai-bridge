@@ -231,11 +231,20 @@ function stopReasonFor(res: ResponsesResponse, sawTool: boolean): AnthropicStopR
   return "end_turn";
 }
 
+// Responses usage -> the harness's four counters. Like the chat path, Copilot's
+// `input_tokens` here is cache-INCLUSIVE (cached_tokens is a SUBSET of it), while
+// the harness treats Anthropic `input_tokens` as cache-EXCLUSIVE and sums all
+// four counters. Emitting input_tokens AND cache_read straight through would
+// double-count the cached tokens and inflate the harness's context estimate, so
+// subtract cached out of input_tokens. The /responses wire carries no
+// cache-creation field, so that counter is always 0.
 function mapResponsesUsage(usage?: ResponsesUsage): AnthropicUsage {
+  const input = usage?.input_tokens ?? 0;
+  const cacheRead = usage?.input_tokens_details?.cached_tokens ?? 0;
   return {
-    input_tokens: usage?.input_tokens ?? 0,
+    input_tokens: Math.max(0, input - cacheRead),
     output_tokens: usage?.output_tokens ?? 0,
-    cache_read_input_tokens: usage?.input_tokens_details?.cached_tokens ?? 0,
+    cache_read_input_tokens: cacheRead,
     cache_creation_input_tokens: 0,
   };
 }
@@ -378,14 +387,23 @@ function eventToAnthropic(state: RState, ev: ResponsesStreamEvent): AnthropicStr
 }
 
 // Responses SSE event stream -> Anthropic SSE event stream. Opens with
-// message_start (usage filled from response.created if present, else zeros, then
-// finalized on completion), streams block events, and closes with message_delta
-// (stop_reason + final usage) and message_stop. The terminal event
-// (response.completed / .incomplete / .failed) carries the authoritative usage
-// and status.
+// message_start (usage filled from response.created if present, else the
+// input-token estimate, then finalized on completion), streams block events, and
+// closes with message_delta (stop_reason + final usage) and message_stop. The
+// terminal event (response.completed / .incomplete / .failed) carries the
+// authoritative usage and status.
+//
+// message_start seeding: like the chat path, Copilot only reports real usage at
+// the END (response.completed), so message_start would carry zeros — which the
+// Claude Code subagent progress tracker latches as "0 tokens" (it samples usage
+// at content_block_stop and never re-reads message_delta). `inputTokensEstimate`
+// (the bridge's tokenizer count, threaded in from the route) seeds a real input
+// number up front, mirroring the Anthropic API; the exact count still corrects
+// in message_delta for the main loop.
 export async function* streamResponsesResponse(
   events: AsyncIterable<ResponsesStreamEvent>,
   model: string,
+  inputTokensEstimate = 0,
 ): AsyncGenerator<AnthropicStreamEvent> {
   const id = newMessageId();
   const state: RState = { next: 0, openIndex: -1, openKind: null };
@@ -397,6 +415,8 @@ export async function* streamResponsesResponse(
   const start = function* (): Generator<AnthropicStreamEvent> {
     if (started) return;
     started = true;
+    const u = mapResponsesUsage(usage);
+    const input_tokens = u.input_tokens || inputTokensEstimate;
     yield {
       type: "message_start",
       message: {
@@ -407,7 +427,7 @@ export async function* streamResponsesResponse(
         content: [],
         stop_reason: null,
         stop_sequence: null,
-        usage: { ...mapResponsesUsage(usage), output_tokens: 0 },
+        usage: { ...u, input_tokens, output_tokens: 0 },
       },
     };
   };

@@ -48,10 +48,20 @@ test("mapResponse maps cache read + creation from prompt_tokens_details", () => 
     },
   };
   const msg = mapResponse(res);
-  assert.equal(msg.usage.input_tokens, 100);
+  // prompt_tokens (100) is cache-INCLUSIVE; the harness sums all four counters, so
+  // input_tokens must exclude the cache buckets: 100 - 60 - 15 = 25.
+  assert.equal(msg.usage.input_tokens, 25);
   assert.equal(msg.usage.output_tokens, 20);
   assert.equal(msg.usage.cache_read_input_tokens, 60);
   assert.equal(msg.usage.cache_creation_input_tokens, 15);
+  // The four counters sum back to the real prompt + output (no double-count).
+  assert.equal(
+    msg.usage.input_tokens +
+      msg.usage.cache_read_input_tokens +
+      msg.usage.cache_creation_input_tokens +
+      msg.usage.output_tokens,
+    120,
+  );
 });
 
 test("mapResponse zeroes absent usage fields (never undefined, for the harness >0 guard)", () => {
@@ -94,7 +104,8 @@ test("streamResponse: usage present before block events lands on message_start",
   const start = events.find((e) => e.type === "message_start");
   assert.ok(start && start.type === "message_start");
   // input + cache visible at message_start; output is 0 there (filled later).
-  assert.equal(start.message.usage.input_tokens, 42);
+  // input_tokens is cache-exclusive: 42 - 30 (cached) - 5 (creation) = 7.
+  assert.equal(start.message.usage.input_tokens, 7);
   assert.equal(start.message.usage.cache_read_input_tokens, 30);
   assert.equal(start.message.usage.cache_creation_input_tokens, 5);
   assert.equal(start.message.usage.output_tokens, 0);
@@ -103,7 +114,7 @@ test("streamResponse: usage present before block events lands on message_start",
   assert.ok(delta && delta.type === "message_delta");
   // full usage (incl. output) lands on message_delta.
   assert.equal(delta.usage.output_tokens, 7);
-  assert.equal(delta.usage.input_tokens, 42);
+  assert.equal(delta.usage.input_tokens, 7);
   assert.equal(delta.usage.cache_read_input_tokens, 30);
 });
 
@@ -148,7 +159,8 @@ test("mapResponsesResponse maps cached_tokens to cache_read; cache_creation is a
     usage: { input_tokens: 80, output_tokens: 12, input_tokens_details: { cached_tokens: 50 } },
   };
   const msg = mapResponsesResponse(res as never);
-  assert.equal(msg.usage.input_tokens, 80);
+  // input_tokens (80) is cache-inclusive; subtract the cached subset: 80 - 50 = 30.
+  assert.equal(msg.usage.input_tokens, 30);
   assert.equal(msg.usage.output_tokens, 12);
   assert.equal(msg.usage.cache_read_input_tokens, 50);
   // /responses has no cache-creation field, so it is reported as 0, not undefined.
@@ -167,7 +179,8 @@ test("streamResponsesResponse takes authoritative usage from the terminal event"
 
   const start = out.find((e) => e.type === "message_start");
   assert.ok(start && start.type === "message_start");
-  assert.equal(start.message.usage.input_tokens, 70);
+  // input_tokens is cache-exclusive: 70 - 40 (cached) = 30.
+  assert.equal(start.message.usage.input_tokens, 30);
   assert.equal(start.message.usage.cache_read_input_tokens, 40);
   assert.equal(start.message.usage.output_tokens, 0);
 
@@ -175,6 +188,54 @@ test("streamResponsesResponse takes authoritative usage from the terminal event"
   assert.ok(delta && delta.type === "message_delta");
   // completion side comes from the terminal response.completed usage.
   assert.equal(delta.usage.output_tokens, 9);
-  assert.equal(delta.usage.input_tokens, 70);
+  assert.equal(delta.usage.input_tokens, 30);
   assert.equal(delta.usage.cache_read_input_tokens, 40);
+});
+
+// --- regression: cache double-count (the gpt-5.5 subagent preempt loop) ---
+
+// The harness sizes context with getTokenCountFromUsage = input + cache_read +
+// cache_creation + output. OpenAI/Copilot report a cache-INCLUSIVE input (cached
+// is a subset of it), so passing input straight through while also emitting the
+// cache buckets counted every cached token twice — nearly doubling the harness's
+// perceived context and tripping "Prompt is too long" on subagents. These use the
+// real numbers from the failing session (input≈15141, cache_read≈14848) and pin
+// the four counters to sum back to the true prompt, not ~2x it.
+test("responses usage does not double-count cache reads (harness four-counter sum)", () => {
+  const res = {
+    id: "resp-loop",
+    model: "gpt-5.5",
+    status: "completed",
+    output: [{ type: "message", role: "assistant", content: [{ type: "output_text", text: "ok" }] }],
+    usage: { input_tokens: 15141, output_tokens: 192, input_tokens_details: { cached_tokens: 14848 } },
+  };
+  const u = mapResponsesResponse(res as never).usage;
+  // Cache-exclusive input: 15141 - 14848 = 293.
+  assert.equal(u.input_tokens, 293);
+  assert.equal(u.cache_read_input_tokens, 14848);
+  // The harness's sum equals the real prompt (15141) + output (192) = 15333, NOT
+  // the buggy 30181 that pushed subagents past the blocking limit.
+  const harnessCount =
+    u.input_tokens + u.cache_creation_input_tokens + u.cache_read_input_tokens + u.output_tokens;
+  assert.equal(harnessCount, 15333);
+});
+
+test("chat usage does not double-count cache reads or creation (harness four-counter sum)", () => {
+  const res: OpenAIResponse = {
+    id: "cc-loop",
+    model: "gpt-4o",
+    choices: [{ index: 0, message: { role: "assistant", content: "ok" }, finish_reason: "stop" }],
+    usage: {
+      prompt_tokens: 15141,
+      completion_tokens: 192,
+      total_tokens: 15333,
+      prompt_tokens_details: { cached_tokens: 12000, cache_creation_input_tokens: 2848 },
+    },
+  };
+  const u = mapResponse(res).usage;
+  // Cache-exclusive input: 15141 - 12000 - 2848 = 293.
+  assert.equal(u.input_tokens, 293);
+  const harnessCount =
+    u.input_tokens + u.cache_creation_input_tokens + u.cache_read_input_tokens + u.output_tokens;
+  assert.equal(harnessCount, 15333);
 });

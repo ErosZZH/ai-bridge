@@ -91,11 +91,24 @@ export function writeClaudeSettings(input: ClaudeSettingsInput): string {
   const path = claudeSettingsPath();
   const settings = readSettings(path);
 
+  const model = withClaudeCode1mSuffix(input.model, input.maxInputTokens);
   settings.env = {
     ...settings.env,
     ANTHROPIC_BASE_URL: input.baseUrl,
     ANTHROPIC_AUTH_TOKEN: input.authToken,
-    ANTHROPIC_MODEL: withClaudeCode1mSuffix(input.model, input.maxInputTokens),
+    ANTHROPIC_MODEL: model,
+    // Pin subagents to the SAME model string (suffix included). Claude Code
+    // spawns some built-in agents on a hardcoded tier — notably Explore, which
+    // for non-`ant` users forces `haiku` (exploreAgent.ts) — so without this the
+    // harness sizes those subagents' LOCAL context window off a bare alias that
+    // carries no [1m], falling back to the 200k default even though the account
+    // has a ~1M window. That mis-sizing fires Claude Code's client-side "Prompt
+    // is too long" preempt before any request reaches the bridge, restarting the
+    // subagent in a loop. CLAUDE_CODE_SUBAGENT_MODEL overrides every per-agent
+    // tier (getAgentModel checks it first), so matching ANTHROPIC_MODEL here
+    // gives subagents the same window AND keeps them on the selected backend
+    // route. The bridge still strips [1m] before forwarding upstream.
+    CLAUDE_CODE_SUBAGENT_MODEL: model,
   };
   // CC sizes its auto-compaction window off this; agent-maestro sets it to the
   // model's input ceiling. Only set when we actually know the window.
@@ -115,15 +128,29 @@ export function writeClaudeSettings(input: ClaudeSettingsInput): string {
 // never reaches settings.json and Claude Code keeps dialing the stale port.
 // Creates the file with just the connection keys when none exists yet; a later
 // `ai-bridge login` then fills in the model. Returns the path written.
+//
+// It also BACKFILLS CLAUDE_CODE_SUBAGENT_MODEL from an existing ANTHROPIC_MODEL
+// when the former is missing or stale. Subagent pinning was added after the first
+// releases, and a re-install with existing Copilot creds runs ONLY this hook
+// (login is skipped), so without the backfill an already-configured deployment
+// would never gain the key — leaving hardcoded-tier subagents (e.g. Explore) on
+// the harness's 200k default window. We only mirror the existing ANTHROPIC_MODEL
+// (suffix included); we never invent or change it, so the "model untouched"
+// contract holds for the source of truth.
 export function syncClaudeConnection(input: ClaudeConnectionInput): string {
   const path = claudeSettingsPath();
   const settings = readSettings(path);
 
-  settings.env = {
+  const env: Record<string, string> = {
     ...settings.env,
     ANTHROPIC_BASE_URL: input.baseUrl,
     ANTHROPIC_AUTH_TOKEN: input.authToken,
   };
+  const configuredModel = settings.env?.ANTHROPIC_MODEL;
+  if (configuredModel && env.CLAUDE_CODE_SUBAGENT_MODEL !== configuredModel) {
+    env.CLAUDE_CODE_SUBAGENT_MODEL = configuredModel;
+  }
+  settings.env = env;
 
   return persistSettings(path, settings);
 }

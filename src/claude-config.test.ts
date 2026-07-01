@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import test from "node:test";
 
 import {
@@ -57,6 +57,39 @@ test("writeClaudeSettings writes the three keys and the 1m suffix", () => {
     assert.equal(onDisk.env.ANTHROPIC_AUTH_TOKEN, "ai-bridge");
     assert.equal(onDisk.env.ANTHROPIC_MODEL, "claude-opus-4.8[1m]");
     assert.equal(onDisk.env.CLAUDE_CODE_AUTO_COMPACT_WINDOW, "936000");
+  });
+});
+
+test("writeClaudeSettings pins CLAUDE_CODE_SUBAGENT_MODEL to the same string as ANTHROPIC_MODEL", () => {
+  withTempHome(() => {
+    // In-band window: both keys carry the [1m] suffix, so subagents (incl. the
+    // hardcoded-haiku Explore agent) get the same 1M local window as the main loop.
+    const path = writeClaudeSettings({
+      baseUrl: "http://127.0.0.1:11500",
+      authToken: "ai-bridge",
+      model: "gpt-5.5",
+      maxInputTokens: 922000,
+    });
+    const onDisk = JSON.parse(readFileSync(path, "utf8")) as { env: Record<string, string> };
+    assert.equal(onDisk.env.ANTHROPIC_MODEL, "gpt-5.5[1m]");
+    assert.equal(onDisk.env.CLAUDE_CODE_SUBAGENT_MODEL, "gpt-5.5[1m]");
+    assert.equal(onDisk.env.CLAUDE_CODE_SUBAGENT_MODEL, onDisk.env.ANTHROPIC_MODEL);
+  });
+});
+
+test("writeClaudeSettings pins the subagent model without a suffix for out-of-band windows", () => {
+  withTempHome(() => {
+    // Below the 1M band: no [1m] on either key, but they still match so subagents
+    // stay on the selected backend route rather than the harness's default tier.
+    const path = writeClaudeSettings({
+      baseUrl: "http://127.0.0.1:11500",
+      authToken: "ai-bridge",
+      model: "claude-haiku-4.5",
+      maxInputTokens: 136000,
+    });
+    const onDisk = JSON.parse(readFileSync(path, "utf8")) as { env: Record<string, string> };
+    assert.equal(onDisk.env.ANTHROPIC_MODEL, "claude-haiku-4.5");
+    assert.equal(onDisk.env.CLAUDE_CODE_SUBAGENT_MODEL, "claude-haiku-4.5");
   });
 });
 
@@ -120,6 +153,40 @@ test("syncClaudeConnection updates base URL + token but leaves model and window 
     // ...while the model + auto-compact window from login survive untouched.
     assert.equal(onDisk.env.ANTHROPIC_MODEL, "claude-opus-4.8[1m]");
     assert.equal(onDisk.env.CLAUDE_CODE_AUTO_COMPACT_WINDOW, "936000");
+    // writeClaudeSettings already pinned the subagent model; sync leaves it as-is.
+    assert.equal(onDisk.env.CLAUDE_CODE_SUBAGENT_MODEL, "claude-opus-4.8[1m]");
+  });
+});
+
+test("syncClaudeConnection backfills CLAUDE_CODE_SUBAGENT_MODEL when a pre-existing config lacks it", () => {
+  withTempHome(() => {
+    const path = claudeSettingsPath();
+    // Simulate a deployment configured BEFORE subagent pinning existed: it has an
+    // ANTHROPIC_MODEL but no CLAUDE_CODE_SUBAGENT_MODEL. A re-install with existing
+    // creds runs ONLY sync-config (login is skipped), so this hook must add it.
+    mkdirSync(dirname(path), { recursive: true });
+    writeFileSync(
+      path,
+      JSON.stringify({ env: { ANTHROPIC_MODEL: "gpt-5.5[1m]", ANTHROPIC_BASE_URL: "http://127.0.0.1:11500" } }, null, 2),
+    );
+
+    syncClaudeConnection({ baseUrl: "http://127.0.0.1:11501", authToken: "ai-bridge" });
+
+    const onDisk = JSON.parse(readFileSync(path, "utf8")) as { env: Record<string, string> };
+    assert.equal(onDisk.env.CLAUDE_CODE_SUBAGENT_MODEL, "gpt-5.5[1m]");
+    // ANTHROPIC_MODEL (source of truth) is left exactly as it was.
+    assert.equal(onDisk.env.ANTHROPIC_MODEL, "gpt-5.5[1m]");
+  });
+});
+
+test("syncClaudeConnection does not invent a subagent model when none is configured", () => {
+  withTempHome(() => {
+    // No ANTHROPIC_MODEL yet (connection-only bootstrap): nothing to mirror, so the
+    // subagent key stays absent until a later `ai-bridge login`/`model` sets both.
+    syncClaudeConnection({ baseUrl: "http://127.0.0.1:11501", authToken: "ai-bridge" });
+    const onDisk = JSON.parse(readFileSync(claudeSettingsPath(), "utf8")) as { env: Record<string, string> };
+    assert.equal(onDisk.env.ANTHROPIC_MODEL, undefined);
+    assert.equal(onDisk.env.CLAUDE_CODE_SUBAGENT_MODEL, undefined);
   });
 });
 

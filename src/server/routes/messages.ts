@@ -127,6 +127,31 @@ function withResolvedModel(body: InboundRequest, info: ModelInfo | null): Inboun
   return { ...body, model: info.id };
 }
 
+// Estimate input tokens for a streaming request, to seed message_start.usage.
+// Copilot only reports real usage on its final stream chunk, so message_start
+// would otherwise carry input_tokens: 0 — which the Claude Code SUBAGENT progress
+// tracker latches as "0 tokens" (it samples usage when each assistant message is
+// yielded, i.e. at message_start's values, and never re-reads the corrected
+// message_delta). Seeding a real input count here mirrors the Anthropic API,
+// which puts input_tokens in message_start. The exact count still arrives in
+// message_delta and is what the main loop reports. Best-effort: any tokenizer
+// failure resolves to 0 (countInputTokens already swallows its own errors), so a
+// missing estimate just falls back to the prior zero behavior rather than failing
+// the request. `openai` is reused when already mapped (chat path); the responses
+// path maps it here since its upstream body isn't the chat shape.
+async function estimateInputTokens(
+  body: InboundRequest,
+  info: ModelInfo | null,
+  openai?: OpenAIRequest,
+): Promise<number> {
+  try {
+    const mapped = openai ?? mapRequest(body);
+    return await countInputTokens(mapped, info?.vendor ?? "", info?.id ?? body.model);
+  } catch {
+    return 0;
+  }
+}
+
 async function handleMessages(c: Ctx): Promise<Response> {
   const logger = c.get("logger");
   let raw: InboundRequest;
@@ -209,15 +234,18 @@ async function handleMessages(c: Ctx): Promise<Response> {
   if (info?.endpoint === "responses") {
     const req = mapRequestToResponses(body);
     scope.upstreamRequest = req;
-    return body.stream
-      ? streamResponsesMessages(c, req, body.model, signal, scope)
-      : completeResponses(c, req, body.model, signal, scope);
+    if (body.stream) {
+      const est = await estimateInputTokens(body, info);
+      return streamResponsesMessages(c, req, body.model, signal, scope, est);
+    }
+    return completeResponses(c, req, body.model, signal, scope);
   }
 
   const openai = mapRequest(body);
   scope.upstreamRequest = openai;
   if (body.stream) {
-    return streamMessages(c, openai, body.model, signal, scope);
+    const est = await estimateInputTokens(body, info, openai);
+    return streamMessages(c, openai, body.model, signal, scope, est);
   }
 
   try {
@@ -272,6 +300,7 @@ function streamMessages(
   model: string,
   signal: AbortSignal,
   scope: ErrorScope,
+  inputTokensEstimate = 0,
 ): Response {
   const logger = c.get("logger");
   return streamSSE(
@@ -279,7 +308,7 @@ function streamMessages(
     async (sse) => {
       const chunks = streamChatCompletion(openai, signal) as AsyncIterable<OpenAIStreamChunk>;
       try {
-        for await (const event of streamResponse(chunks, model)) {
+        for await (const event of streamResponse(chunks, model, inputTokensEstimate)) {
           if (signal.aborted) break;
           await sse.writeSSE({ event: event.type, data: JSON.stringify(event) });
         }
@@ -305,6 +334,7 @@ function streamResponsesMessages(
   model: string,
   signal: AbortSignal,
   scope: ErrorScope,
+  inputTokensEstimate = 0,
 ): Response {
   const logger = c.get("logger");
   return streamSSE(
@@ -312,7 +342,7 @@ function streamResponsesMessages(
     async (sse) => {
       const events = streamResponsesCompletion(req, signal);
       try {
-        for await (const event of streamResponsesResponse(events as never, model)) {
+        for await (const event of streamResponsesResponse(events as never, model, inputTokensEstimate)) {
           if (signal.aborted) break;
           await sse.writeSSE({ event: event.type, data: JSON.stringify(event) });
         }

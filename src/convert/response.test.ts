@@ -115,8 +115,11 @@ test("cache fields in prompt_tokens_details map to read/creation counters", () =
       prompt_tokens_details: { cached_tokens: 80, cache_creation_input_tokens: 20 },
     },
   };
+  // prompt_tokens (100) is cache-inclusive; cached (80) + creation (20) are subsets,
+  // so the cache-exclusive input_tokens is 100 - 80 - 20 = 0. The harness sums all
+  // four counters, so this keeps its total at the real 105 instead of 205.
   assert.deepEqual(mapResponse(res).usage, {
-    input_tokens: 100,
+    input_tokens: 0,
     output_tokens: 5,
     cache_read_input_tokens: 80,
     cache_creation_input_tokens: 20,
@@ -180,6 +183,50 @@ test("text stream -> message_start, block lifecycle, message_delta/stop", async 
     },
     { type: "message_stop" },
   ]);
+});
+
+test("stream seeds message_start.input_tokens from the estimate; real usage wins in delta", async () => {
+  // Regression: Copilot only reports usage on its final chunk, so message_start
+  // would carry input_tokens: 0, which the Claude Code subagent progress tracker
+  // latches as "0 tokens". Seeding from the bridge's own tokenizer estimate makes
+  // message_start show a real input count, mirroring the Anthropic API.
+  const events = await collect(
+    streamResponse(
+      gen([
+        { choices: [{ delta: { content: "hi" }, finish_reason: null }] },
+        { choices: [{ delta: {}, finish_reason: "stop" }], usage: { prompt_tokens: 123, completion_tokens: 2, total_tokens: 125 } },
+      ]),
+      "gpt-4o",
+      99, // input-token estimate
+    ),
+  );
+
+  const start = events.find((e) => e.type === "message_start") as any;
+  const delta = events.find((e) => e.type === "message_delta") as any;
+  // message_start shows the estimate (Copilot hasn't reported real usage yet)...
+  assert.equal(start.message.usage.input_tokens, 99);
+  assert.equal(start.message.usage.output_tokens, 0);
+  // ...and message_delta carries the exact Copilot count, overriding the estimate.
+  assert.equal(delta.usage.input_tokens, 123);
+  assert.equal(delta.usage.output_tokens, 2);
+});
+
+test("stream: a real prompt count on an early chunk beats the estimate in message_start", async () => {
+  // If Copilot ever reports usage before the first block (rare), that real value
+  // must win over the seed; the estimate only fills the zero gap.
+  const events = await collect(
+    streamResponse(
+      gen([
+        { choices: [{ delta: { content: "hi" }, finish_reason: null }], usage: { prompt_tokens: 40, completion_tokens: 0, total_tokens: 40 } },
+        { choices: [{ delta: {}, finish_reason: "stop" }], usage: { prompt_tokens: 40, completion_tokens: 1, total_tokens: 41 } },
+      ]),
+      "gpt-4o",
+      99, // estimate should be ignored
+    ),
+  );
+
+  const start = events.find((e) => e.type === "message_start") as any;
+  assert.equal(start.message.usage.input_tokens, 40);
 });
 
 test("fragmented tool-call arguments reassemble via input_json_delta, keyed by index", async () => {

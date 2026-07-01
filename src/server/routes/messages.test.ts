@@ -160,7 +160,8 @@ test("POST /v1/messages non-stream -> Anthropic Message with exact usage", async
   assert.equal(body.id, "msg_test");
   assert.deepEqual(body.content, [{ type: "text", text: "hi there" }]);
   assert.equal(body.stop_reason, "end_turn");
-  assert.equal(body.usage.input_tokens, 12);
+  // input_tokens is cache-exclusive: prompt 12 - cached 8 = 4.
+  assert.equal(body.usage.input_tokens, 4);
   assert.equal(body.usage.output_tokens, 3);
   assert.equal(body.usage.cache_read_input_tokens, 8);
 });
@@ -718,8 +719,11 @@ test("POST /v1/messages surfaces cache_read + cache_creation usage (compaction i
   });
   assert.equal(res.status, 200);
   const body = (await res.json()) as {
-    usage: { cache_read_input_tokens: number; cache_creation_input_tokens: number };
+    usage: { input_tokens: number; cache_read_input_tokens: number; cache_creation_input_tokens: number };
   };
+  // input_tokens is cache-exclusive: 1000 - 800 (read) - 120 (creation) = 80, so
+  // the harness's four-counter sum stays at the real 1000 input, not 1920.
+  assert.equal(body.usage.input_tokens, 80);
   assert.equal(body.usage.cache_read_input_tokens, 800);
   assert.equal(body.usage.cache_creation_input_tokens, 120);
 });

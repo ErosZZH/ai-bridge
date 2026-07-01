@@ -259,13 +259,26 @@ function mapStopReason(reason: OpenAIFinishReason): AnthropicStopReason {
 // Copilot's OpenAI usage -> the harness's four counters. cached_tokens are
 // reads; cache_creation_input_tokens are writes. Absent fields are 0, never
 // undefined, so the harness's >0 guard reads them cleanly.
+//
+// Cache semantics differ between the two APIs and the harness follows Anthropic:
+// OpenAI/Copilot `prompt_tokens` is cache-INCLUSIVE (cached + cache-creation are
+// SUBSETS of it), whereas Anthropic `input_tokens` is cache-EXCLUSIVE (the cache
+// buckets are ADDED on top). The harness's getTokenCountFromUsage sums all four
+// counters (input + cache_read + cache_creation + output), so copying
+// prompt_tokens straight into input_tokens while ALSO emitting the cache buckets
+// double-counts every cached token — inflating the harness's perceived context by
+// up to ~2x and tripping its "Prompt is too long" preemption. Subtract the cache
+// buckets out of input_tokens so the four counters sum back to the real prompt.
 function mapUsage(usage?: CopilotUsage): AnthropicUsage {
   const details = usage?.prompt_tokens_details;
+  const prompt = usage?.prompt_tokens ?? 0;
+  const cacheRead = details?.cached_tokens ?? 0;
+  const cacheCreation = details?.cache_creation_input_tokens ?? 0;
   return {
-    input_tokens: usage?.prompt_tokens ?? 0,
+    input_tokens: Math.max(0, prompt - cacheRead - cacheCreation),
     output_tokens: usage?.completion_tokens ?? 0,
-    cache_read_input_tokens: details?.cached_tokens ?? 0,
-    cache_creation_input_tokens: details?.cache_creation_input_tokens ?? 0,
+    cache_read_input_tokens: cacheRead,
+    cache_creation_input_tokens: cacheCreation,
   };
 }
 
@@ -422,12 +435,19 @@ function closeOpen(state: StreamState, events: AnthropicStreamEvent[]): void {
 //
 // Usage placement: Copilot sends the usage object on a late chunk whose choices
 // are empty. We keep the latest usage seen and fold the prompt/cache side into
-// message_start and the completion side into message_delta. If it only arrives
-// at the end, message_start carries zeros — acceptable, since the harness fills
-// output from message_delta and treats input as monotonic.
+// message_start and the completion side into message_delta. Because that usage
+// only arrives at the END, message_start would otherwise carry zeros — which the
+// Claude Code SUBAGENT progress tracker reports as "0 tokens": it samples usage
+// when each assistant message is yielded (at content_block_stop, i.e.
+// message_start's values) and never re-reads the later message_delta. The real
+// Anthropic API avoids this by putting input_tokens in message_start; we mirror
+// that with `inputTokensEstimate` (the bridge's own tokenizer count, threaded in
+// from the route) so subagents show a real, input-dominated number. The exact
+// count still lands in message_delta, which the main loop reads.
 export async function* streamResponse(
   chunks: AsyncIterable<OpenAIStreamChunk>,
   model: string,
+  inputTokensEstimate = 0,
 ): AsyncGenerator<AnthropicStreamEvent> {
   const id = idImpl();
   const state: StreamState = { next: 0, openIndex: -1, openKind: null, toolBlockByIndex: new Map() };
@@ -442,6 +462,10 @@ export async function* streamResponse(
     if (started) return;
     started = true;
     const u = mapUsage(usage);
+    // Seed input_tokens from the estimate only when Copilot hasn't already
+    // reported a real prompt count on an early chunk (it almost never has this
+    // soon). A real value always wins.
+    const input_tokens = u.input_tokens || inputTokensEstimate;
     yield {
       type: "message_start",
       message: {
@@ -452,7 +476,7 @@ export async function* streamResponse(
         content: [],
         stop_reason: null,
         stop_sequence: null,
-        usage: { ...u, output_tokens: 0 },
+        usage: { ...u, input_tokens, output_tokens: 0 },
       },
     };
   };

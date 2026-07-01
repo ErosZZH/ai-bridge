@@ -95,7 +95,8 @@ test("output[] message text -> one text block; usage mapped", () => {
   const m = mapResponsesResponse(res);
   assert.deepEqual(m.content, [{ type: "text", text: "hello one" }]);
   assert.equal(m.stop_reason, "end_turn");
-  assert.equal(m.usage.input_tokens, 19);
+  // input_tokens is cache-exclusive: 19 - 3 (cached) = 16.
+  assert.equal(m.usage.input_tokens, 16);
   assert.equal(m.usage.output_tokens, 20);
   assert.equal(m.usage.cache_read_input_tokens, 3);
   assert.equal(m.model, "gpt-5.5-2026-04-23");
@@ -172,6 +173,29 @@ test("text stream -> full Anthropic lifecycle", async () => {
   };
   assert.equal(final.delta.stop_reason, "end_turn");
   assert.equal(final.usage.output_tokens, 5);
+});
+
+test("stream seeds message_start.input_tokens from the estimate; real usage wins in delta", async () => {
+  // Regression: /responses reports usage only on response.completed, so
+  // message_start would carry input_tokens: 0, which the Claude Code subagent
+  // progress tracker shows as "0 tokens". Seed it from the bridge's estimate.
+  const events = [
+    { type: "response.created", response: { id: "r1" } },
+    { type: "response.output_item.added", item: { type: "message" } },
+    { type: "response.output_text.delta", delta: "hi" },
+    {
+      type: "response.completed",
+      response: { status: "completed", usage: { input_tokens: 77, output_tokens: 4 } },
+    },
+  ];
+  const out = await collect(streamResponsesResponse(feed(events), "gpt-5.5", 55));
+  const start = out.find((e) => e.type === "message_start") as any;
+  const delta = out.find((e) => e.type === "message_delta") as any;
+  // message_start shows the estimate; message_delta carries the exact count.
+  assert.equal(start.message.usage.input_tokens, 55);
+  assert.equal(start.message.usage.output_tokens, 0);
+  assert.equal(delta.usage.input_tokens, 77);
+  assert.equal(delta.usage.output_tokens, 4);
 });
 
 test("function_call stream -> tool_use block + input_json_delta + tool_use stop", async () => {
