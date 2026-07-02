@@ -125,7 +125,7 @@ async function main() {
   // can go stale before the Scheduled Task binds at logon (e.g. a WSL guest grabs
   // it in between) — only the live listen() result is authoritative.
   const startPort = config.port;
-  const { port } = await listenWithFallback(
+  const { server, port } = await listenWithFallback(
     app.fetch,
     config.host,
     startPort,
@@ -158,14 +158,32 @@ async function main() {
   logger.info("Claude Code config lives in ~/.claude/settings.json");
   logger.info("  run `ai-bridge login` to wire it, or `ai-bridge model` to change model");
 
-  // Reclaim the headless search browser on shutdown so a stopped/restarted
-  // service never leaves an orphaned Chrome behind. Best-effort and idempotent.
+  // Terminate cleanly on service stop/restart. Registering a SIGTERM/SIGINT
+  // listener overrides Node's default (terminate-on-signal), so this handler is
+  // now solely responsible for exiting — if it doesn't, the HTTP listener keeps
+  // the event loop alive and the process ignores SIGTERM until systemd/launchd
+  // escalate to SIGKILL (a ~90s hang that made `./install.sh uninstall` and
+  // every stop/restart stall). Close the listener so in-flight requests drain,
+  // reclaim the headless search browser so no orphaned Chrome is left behind,
+  // then exit. A short watchdog force-exits if any close() wedges, and its
+  // unref() keeps the timer itself from holding the loop open on a clean exit.
+  let shuttingDown = false;
   const shutdown = () => {
-    void teardownBrowser();
+    if (shuttingDown) return;
+    shuttingDown = true;
+
+    const watchdog = setTimeout(() => process.exit(0), 3000);
+    watchdog.unref?.();
+
+    void (async () => {
+      await new Promise<void>((resolve) => server.close(() => resolve()));
+      await teardownBrowser().catch(() => {});
+      clearTimeout(watchdog);
+      process.exit(0);
+    })();
   };
   process.once("SIGTERM", shutdown);
   process.once("SIGINT", shutdown);
-  process.once("beforeExit", shutdown);
 }
 
 const command = process.argv[2];
