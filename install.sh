@@ -80,21 +80,39 @@ detect_proxy() {
 }
 
 # --- port selection ----------------------------------------------------------
-# Return 0 if $BIND_HOST:$1 is free to bind, non-zero otherwise. We probe with
-# node's net.createServer (the same runtime the server binds with) instead of
-# nc/ss/lsof: those may be absent, and only an actual listen() reflects the bind
-# semantics @hono/node-server uses. exclusive:true rejects any SO_REUSEADDR-style
-# shared bind so a port another instance already holds reads as taken.
+# Return 0 if $BIND_HOST:$1 is free for us to serve on, non-zero otherwise. The
+# probe does two things, in order: (1) CONNECT to the port on both loopbacks, and
+# (2) only if nothing answers, try to bind $BIND_HOST with node's createServer
+# (the same runtime the server binds with). The connect step is what fixes the
+# Windows+WSL collision: a WSL guest forwarding 11500 to its Linux server almost
+# never binds exactly 127.0.0.1 — depending on WSL networking mode it surfaces as
+# 0.0.0.0 or [::] — so the old bind-only probe on 127.0.0.1 would succeed against
+# a *different* address and wrongly report the port free, leaving both sides on
+# 11500 and Claude Code pointed at a dead base URL. Connecting detects anyone
+# already listening regardless of the family they bound; the follow-up listen()
+# still catches the rare "nothing listening yet but we can't bind" case. We use
+# node (not nc/ss/lsof, which may be absent). exclusive:true rejects any
+# SO_REUSEADDR-style shared bind. A refused connect on a free port returns
+# instantly; the 1000ms timeout only bounds the odd black-holed port (taken).
 port_is_free() {
   local node_bin="$1" port="$2"
   AI_BRIDGE_PROBE_HOST="$BIND_HOST" AI_BRIDGE_PROBE_PORT="$port" "$node_bin" -e '
     const net = require("net");
-    const s = net.createServer();
-    s.once("error", () => process.exit(1));
-    s.listen(
-      { host: process.env.AI_BRIDGE_PROBE_HOST, port: Number(process.env.AI_BRIDGE_PROBE_PORT), exclusive: true },
-      () => s.close(() => process.exit(0)),
-    );
+    const P = Number(process.env.AI_BRIDGE_PROBE_PORT);
+    const H = process.env.AI_BRIDGE_PROBE_HOST;
+    const answers = (host) => new Promise((res) => {
+      const c = net.connect({ host, port: P });
+      c.setTimeout(1000);
+      c.once("connect", () => { c.destroy(); res(true); });
+      c.once("timeout", () => { c.destroy(); res(true); });
+      c.once("error", () => res(false));
+    });
+    (async () => {
+      if (await answers("127.0.0.1") || await answers("::1")) process.exit(1);
+      const s = net.createServer();
+      s.once("error", () => process.exit(1));
+      s.listen({ host: H, port: P, exclusive: true }, () => s.close(() => process.exit(0)));
+    })();
   ' >/dev/null 2>&1
 }
 
@@ -215,13 +233,18 @@ uninstall() {
 # preflight: node >= 22 and npm
 # =============================================================================
 preflight() {
-  command -v node >/dev/null 2>&1 || die "node not found on PATH. Install Node.js >= 22 first."
-  command -v npm  >/dev/null 2>&1 || die "npm not found on PATH. Install Node.js >= 22 first."
+  command -v node >/dev/null 2>&1 || die "node not found on PATH. Install Node.js >= 22.15 first."
+  command -v npm  >/dev/null 2>&1 || die "npm not found on PATH. Install Node.js >= 22.15 first."
 
-  local major
-  major="$(node -p 'process.versions.node.split(".")[0]')"
-  if [ "$major" -lt 22 ]; then
-    die "Node.js >= 22 required, found $(node -v). Upgrade Node and re-run."
+  # node-libcurl (5.x) calls tls.getCACertificates() at native-addon init, which
+  # only exists in Node >= 22.15. On older 22.x the addon fails to load, so require
+  # 22.15 explicitly rather than just 22 — matching install.ps1's floor.
+  local ver major minor
+  ver="$(node -p 'process.versions.node')"
+  major="${ver%%.*}"
+  minor="${ver#*.}"; minor="${minor%%.*}"
+  if [ "$major" -lt 22 ] || { [ "$major" -eq 22 ] && [ "$minor" -lt 15 ]; }; then
+    die "Node.js >= 22.15 required (node-libcurl uses tls.getCACertificates), found $(node -v). Upgrade Node and re-run."
   fi
   info "using $(node -v) at $(command -v node)"
 }

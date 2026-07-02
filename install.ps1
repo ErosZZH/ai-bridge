@@ -105,23 +105,30 @@ function Invoke-DetectProxy {
 }
 
 # --- port selection ----------------------------------------------------------
-# True if $BindHost:$Port is free to bind. We probe with node's net.createServer
-# (the same runtime the server binds with) rather than Test-NetConnection or a
-# raw socket: only an actual listen() reflects the bind semantics
-# @hono/node-server uses, and node is already a hard dependency here.
-# exclusive:true rejects any SO_REUSEADDR-style shared bind so a port another
-# instance already holds reads as taken.
+# True if $BindHost:$Port is free for us to serve on. The probe does two things,
+# in order: (1) CONNECT to the port on both loopbacks, and (2) only if nothing
+# answers, try to bind $BindHost with node's net.createServer (the same runtime
+# the server uses). The connect step is what fixes the Windows+WSL collision: a
+# WSL guest forwarding 11500 to its Linux server almost never binds exactly
+# 127.0.0.1 -- depending on WSL networking mode it surfaces as 0.0.0.0 or [::] --
+# so the old bind-only probe on 127.0.0.1 would succeed against a *different*
+# address and wrongly report the port free, leaving the Windows service to also
+# grab 11500 and bake a doomed base URL into ~/.claude/settings.json. Connecting
+# detects anyone already listening regardless of the family they bound; the
+# follow-up listen() still catches the rare "nothing listening yet but we can't
+# bind" case. exclusive:true rejects any SO_REUSEADDR-style shared bind.
 function Test-PortFree {
     param([string]$NodeBin, [int]$Port)
-    # Single-quoted JS on ONE line. Windows PowerShell 5.1 -- which this installer
-    # relaunches via powershell.exe for elevation, and which most Windows users run
-    # -- does NOT escape embedded double quotes when handing an argument to a native
-    # exe, so double-quoted JS would reach node as require(net) -> ReferenceError ->
-    # exit 1 for every port. Keeping the probe free of double quotes (and on one
-    # line) sidesteps that quoting bug. Single quotes inside a single-quoted
-    # here-string are literal, so they survive to node intact.
+    # Single-quoted JS on ONE line, NO double quotes. Windows PowerShell 5.1 --
+    # which this installer relaunches via powershell.exe for elevation, and which
+    # most Windows users run -- does NOT escape embedded double quotes when handing
+    # an argument to a native exe, so double-quoted JS would reach node mangled and
+    # exit 1 for every port. Single quotes inside a single-quoted here-string are
+    # literal, so they survive to node intact. A refused connect on a free port
+    # returns instantly (no timeout wait); the 1000ms timeout only bounds the odd
+    # black-holed port, which we treat as taken.
     $probe = @'
-const net=require('net');const s=net.createServer();s.once('error',()=>process.exit(1));s.listen({host:process.env.AI_BRIDGE_PROBE_HOST,port:Number(process.env.AI_BRIDGE_PROBE_PORT),exclusive:true},()=>s.close(()=>process.exit(0)));
+const net=require('net');const P=Number(process.env.AI_BRIDGE_PROBE_PORT);const H=process.env.AI_BRIDGE_PROBE_HOST;const a=h=>new Promise(r=>{const c=net.connect({host:h,port:P});c.setTimeout(1000);c.once('connect',()=>{c.destroy();r(true)});c.once('timeout',()=>{c.destroy();r(true)});c.once('error',()=>r(false))});(async()=>{if(await a('127.0.0.1')||await a('::1'))process.exit(1);const s=net.createServer();s.once('error',()=>process.exit(1));s.listen({host:H,port:P,exclusive:true},()=>s.close(()=>process.exit(0)))})();
 '@
     $env:AI_BRIDGE_PROBE_HOST = $BindHost
     $env:AI_BRIDGE_PROBE_PORT = "$Port"

@@ -1,0 +1,15 @@
+# Keep line endings deterministic regardless of each contributor's
+# core.autocrlf. Without this, a Windows clone with core.autocrlf=true smudges
+# files to CRLF on checkout.
+#
+# Repo-wide default: let Git auto-detect text vs binary, and check out every
+# text file with LF. The whole tree is already LF in the index, so this
+# normalizes with zero churn while protecting future files (and this file
+# itself) from CRLF smudging.
+* text=auto eol=lf
+
+# Belt-and-suspenders for the scripts where CRLF actually breaks execution: a
+# CRLF shebang ("#!/usr/bin/env bash\r") fails to exec on Linux/WSL/macOS with a
+# "bad interpreter" error. PowerShell reads LF cleanly on both 5.1 and 7.
+*.sh   text eol=lf
+*.ps1  text eol=lf
