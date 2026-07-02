@@ -320,10 +320,6 @@ Environment=AI_BRIDGE_PORT=$PORT
 $proxy_env
 Restart=on-failure
 RestartSec=3
-# Cap how long systemd waits after SIGTERM before escalating to SIGKILL. The
-# service exits promptly on SIGTERM, but this bounds the stop/uninstall wait to
-# a few seconds even if a future regression makes shutdown hang (the default is
-# 90s, which is what made `./install.sh uninstall` appear stuck).
 TimeoutStopSec=5
 
 [Install]
