@@ -396,8 +396,18 @@ function Build-NodeLibcurl {
     if (-not (Test-Path $nlc)) { throw "node-libcurl is not installed under node_modules" }
 
     # Idempotent: if the addon already loads (e.g. a re-run), skip the slow build.
+    # This probe is EXPECTED to fail on a fresh machine (addon not built yet); we
+    # rely solely on $LASTEXITCODE. Windows PowerShell 5.1 promotes a native
+    # command's stderr to a terminating NativeCommandError while
+    # $ErrorActionPreference='Stop' (set at top of script), and 2>$null does NOT
+    # suppress that -- so scope the preference down to non-terminating around the
+    # probe. Without this, init.ps1 (which runs us under 5.1) aborts here.
     Push-Location $RepoDir
-    try { & $NodeBin -e "require('node-libcurl').Curl.getVersion()" 2>$null } finally { Pop-Location }
+    $prevEap = $ErrorActionPreference
+    $ErrorActionPreference = 'SilentlyContinue'
+    try     { & $NodeBin -e "require('node-libcurl').Curl.getVersion()" 2>$null }
+    catch   { }
+    finally { $ErrorActionPreference = $prevEap; Pop-Location }
     if ($LASTEXITCODE -eq 0) {
         Write-Info "node-libcurl already built and loadable -- skipping native build"
         return
