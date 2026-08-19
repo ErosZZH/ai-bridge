@@ -19,6 +19,8 @@ import {
   type OpenAIStreamChunk,
   type ResponsesRequest,
   type ResponsesResponse,
+  type ResponsesConversionContext,
+  createResponsesConversionContext,
   mapRequestToResponses,
   mapResponsesResponse,
   streamResponsesResponse,
@@ -233,12 +235,13 @@ async function handleMessages(c: Ctx): Promise<Response> {
   // else (and `auto`) takes the chat/completions path.
   if (info?.endpoint === "responses") {
     const req = mapRequestToResponses(body);
+    const conversionContext = createResponsesConversionContext(req);
     scope.upstreamRequest = req;
     if (body.stream) {
       const est = await estimateInputTokens(body, info);
-      return streamResponsesMessages(c, req, body.model, signal, scope, est);
+      return streamResponsesMessages(c, req, body.model, signal, scope, est, conversionContext);
     }
-    return completeResponses(c, req, body.model, signal, scope);
+    return completeResponses(c, req, body.model, signal, scope, conversionContext);
   }
 
   const openai = mapRequest(body);
@@ -272,10 +275,11 @@ async function completeResponses(
   model: string,
   signal: AbortSignal,
   scope: ErrorScope,
+  conversionContext: ResponsesConversionContext,
 ): Promise<Response> {
   try {
     const res = (await responsesCompletion(req, signal)) as ResponsesResponse;
-    const mapped = mapResponsesResponse(res);
+    const mapped = mapResponsesResponse(res, conversionContext);
     c.get("logger").info("/v1/messages (responses)", {
       model,
       in: mapped.usage.input_tokens,
@@ -334,7 +338,8 @@ function streamResponsesMessages(
   model: string,
   signal: AbortSignal,
   scope: ErrorScope,
-  inputTokensEstimate = 0,
+  inputTokensEstimate: number,
+  conversionContext: ResponsesConversionContext,
 ): Response {
   const logger = c.get("logger");
   return streamSSE(
@@ -342,7 +347,12 @@ function streamResponsesMessages(
     async (sse) => {
       const events = streamResponsesCompletion(req, signal);
       try {
-        for await (const event of streamResponsesResponse(events as never, model, inputTokensEstimate)) {
+        for await (const event of streamResponsesResponse(
+          events as never,
+          model,
+          inputTokensEstimate,
+          conversionContext,
+        )) {
           if (signal.aborted) break;
           await sse.writeSSE({ event: event.type, data: JSON.stringify(event) });
         }

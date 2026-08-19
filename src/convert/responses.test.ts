@@ -4,6 +4,7 @@ import test from "node:test";
 import { __setResponseDeps } from "./response.js";
 import {
   type ResponsesResponse,
+  createResponsesConversionContext,
   mapRequestToResponses,
   mapResponsesResponse,
   streamResponsesResponse,
@@ -11,6 +12,17 @@ import {
 
 // Pin the message id so streaming/non-stream envelopes are deterministic.
 __setResponseDeps({ id: () => "msg_test" });
+
+function toolContext(...names: string[]) {
+  return createResponsesConversionContext({
+    model: "gpt-5.5",
+    input: [],
+    tools: names.map((name) => ({ type: "function", name, description: "", parameters: {} })),
+  });
+}
+
+const noTools = toolContext();
+const weatherTool = toolContext("get_weather");
 
 // --- request mapping ---
 
@@ -92,7 +104,7 @@ test("output[] message text -> one text block; usage mapped", () => {
       input_tokens_details: { cached_tokens: 3 },
     },
   };
-  const m = mapResponsesResponse(res);
+  const m = mapResponsesResponse(res, noTools);
   assert.deepEqual(m.content, [{ type: "text", text: "hello one" }]);
   assert.equal(m.stop_reason, "end_turn");
   // input_tokens is cache-exclusive: 19 - 3 (cached) = 16.
@@ -109,11 +121,22 @@ test("function_call output -> tool_use block; stop_reason tool_use", () => {
       { type: "function_call", call_id: "call_9", name: "get_weather", arguments: '{"city":"Paris"}' } as never,
     ],
   };
-  const m = mapResponsesResponse(res);
+  const m = mapResponsesResponse(res, weatherTool);
   assert.deepEqual(m.content, [
     { type: "tool_use", id: "call_9", name: "get_weather", input: { city: "Paris" } },
   ]);
   assert.equal(m.stop_reason, "tool_use");
+});
+
+test("unadvertised function calls are rejected instead of reaching the harness", () => {
+  const res: ResponsesResponse = {
+    status: "completed",
+    output: [{ type: "function_call", call_id: "call_bad", name: "parallel", arguments: "{}" } as never],
+  };
+  assert.throws(
+    () => mapResponsesResponse(res, weatherTool),
+    /unadvertised function 'parallel'.*get_weather/,
+  );
 });
 
 test("incomplete due to max_output_tokens -> max_tokens", () => {
@@ -122,7 +145,7 @@ test("incomplete due to max_output_tokens -> max_tokens", () => {
     incomplete_details: { reason: "max_output_tokens" },
     output: [{ type: "message", role: "assistant", content: [{ type: "output_text", text: "par" }] }],
   };
-  const m = mapResponsesResponse(res);
+  const m = mapResponsesResponse(res, noTools);
   assert.equal(m.stop_reason, "max_tokens");
 });
 
@@ -150,7 +173,7 @@ test("text stream -> full Anthropic lifecycle", async () => {
       response: { status: "completed", usage: { input_tokens: 9, output_tokens: 5 } },
     },
   ];
-  const out = await collect(streamResponsesResponse(feed(events), "gpt-5.5"));
+  const out = await collect(streamResponsesResponse(feed(events), "gpt-5.5", 0, noTools));
   const types = out.map((e) => e.type);
   assert.deepEqual(types, [
     "message_start",
@@ -188,7 +211,7 @@ test("stream seeds message_start.input_tokens from the estimate; real usage wins
       response: { status: "completed", usage: { input_tokens: 77, output_tokens: 4 } },
     },
   ];
-  const out = await collect(streamResponsesResponse(feed(events), "gpt-5.5", 55));
+  const out = await collect(streamResponsesResponse(feed(events), "gpt-5.5", 55, noTools));
   const start = out.find((e) => e.type === "message_start") as any;
   const delta = out.find((e) => e.type === "message_delta") as any;
   // message_start shows the estimate; message_delta carries the exact count.
@@ -213,7 +236,7 @@ test("function_call stream -> tool_use block + input_json_delta + tool_use stop"
       response: { status: "completed", usage: { input_tokens: 53, output_tokens: 18 } },
     },
   ];
-  const out = await collect(streamResponsesResponse(feed(events), "gpt-5.5"));
+  const out = await collect(streamResponsesResponse(feed(events), "gpt-5.5", 0, weatherTool));
   const start = out.find((e) => e.type === "content_block_start") as {
     content_block: { type: string; id: string; name: string };
   };
@@ -229,7 +252,94 @@ test("function_call stream -> tool_use block + input_json_delta + tool_use stop"
   assert.equal(final.delta.stop_reason, "tool_use");
 });
 
+test("function-call done events are idempotent across both Responses closers", async () => {
+  const events = [
+    {
+      type: "response.output_item.added",
+      output_index: 0,
+      item: { type: "function_call", id: "item_1", call_id: "call_1", name: "get_weather" },
+    },
+    { type: "response.function_call_arguments.delta", output_index: 0, delta: "{}" },
+    { type: "response.function_call_arguments.done", output_index: 0 },
+    {
+      type: "response.output_item.done",
+      output_index: 0,
+      item: { type: "function_call", id: "item_1", call_id: "call_1", name: "get_weather", arguments: "{}" },
+    },
+  ];
+  const out = await collect(streamResponsesResponse(feed(events), "gpt-5.5", 0, weatherTool));
+  assert.equal(out.filter((event) => event.type === "content_block_start").length, 1);
+});
+
+test("interleaved function calls keep arguments correlated and blocks contiguous", async () => {
+  const context = toolContext("first", "second");
+  const events = [
+    {
+      type: "response.output_item.added",
+      output_index: 0,
+      item: { type: "function_call", id: "item_1", call_id: "call_1", name: "first" },
+    },
+    {
+      type: "response.output_item.added",
+      output_index: 1,
+      item: { type: "function_call", id: "item_2", call_id: "call_2", name: "second" },
+    },
+    { type: "response.function_call_arguments.delta", output_index: 0, delta: '{"a":' },
+    { type: "response.function_call_arguments.delta", item_id: "item_2", delta: '{"b":' },
+    { type: "response.function_call_arguments.delta", call_id: "call_1", delta: "1}" },
+    { type: "response.function_call_arguments.delta", output_index: 1, delta: "2}" },
+    { type: "response.function_call_arguments.done", item_id: "item_2" },
+    { type: "response.function_call_arguments.done", output_index: 0 },
+    { type: "response.completed", response: { status: "completed" } },
+  ];
+
+  const out = await collect(streamResponsesResponse(feed(events), "gpt-5.5", 0, context));
+  const blocks = out.filter((event) => event.type.startsWith("content_block_"));
+  assert.deepEqual(blocks.map((event) => event.type), [
+    "content_block_start",
+    "content_block_delta",
+    "content_block_delta",
+    "content_block_stop",
+    "content_block_start",
+    "content_block_delta",
+    "content_block_delta",
+    "content_block_stop",
+  ]);
+  const starts = blocks.filter((event) => event.type === "content_block_start") as any[];
+  assert.deepEqual(starts.map((event) => event.content_block.name), ["first", "second"]);
+  for (const start of starts) {
+    const fragments = blocks
+      .filter((event: any) => event.type === "content_block_delta" && event.index === start.index)
+      .map((event: any) => event.delta.partial_json)
+      .join("");
+    assert.equal(fragments, start.content_block.name === "first" ? '{"a":1}' : '{"b":2}');
+  }
+});
+
+test("ambiguous uncorrelated arguments fail instead of choosing a call", async () => {
+  const context = toolContext("first", "second");
+  const events = [
+    { type: "response.output_item.added", item: { type: "function_call", call_id: "call_1", name: "first" } },
+    { type: "response.output_item.added", item: { type: "function_call", call_id: "call_2", name: "second" } },
+    { type: "response.function_call_arguments.delta", delta: "{}" },
+  ];
+  await assert.rejects(
+    () => collect(streamResponsesResponse(feed(events), "gpt-5.5", 0, context)),
+    /ambiguous \(2 pending calls/,
+  );
+});
+
+test("stream rejects an unadvertised parallel call before emitting a tool block", async () => {
+  const events = [
+    { type: "response.output_item.added", item: { type: "function_call", call_id: "call_bad", name: "parallel" } },
+  ];
+  await assert.rejects(
+    () => collect(streamResponsesResponse(feed(events), "gpt-5.5", 0, weatherTool)),
+    /unadvertised function 'parallel'/,
+  );
+});
+
 test("empty stream still yields a well-formed envelope", async () => {
-  const out = await collect(streamResponsesResponse(feed([{ type: "response.completed", response: { status: "completed" } }]), "gpt-5.5"));
+  const out = await collect(streamResponsesResponse(feed([{ type: "response.completed", response: { status: "completed" } }]), "gpt-5.5", 0, noTools));
   assert.deepEqual(out.map((e) => e.type), ["message_start", "message_delta", "message_stop"]);
 });

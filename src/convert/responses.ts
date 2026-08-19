@@ -63,6 +63,21 @@ export type ResponsesRequest = {
   top_p?: number;
 };
 
+export type ResponsesConversionContext = {
+  readonly advertisedToolNames: ReadonlySet<string>;
+};
+
+// Response conversion must be constrained by the exact function definitions we
+// sent upstream. Otherwise an invented name can escape as a tool_use that the
+// harness never advertised and cannot dispatch.
+export function createResponsesConversionContext(
+  req: ResponsesRequest,
+): ResponsesConversionContext {
+  return {
+    advertisedToolNames: new Set((req.tools ?? []).map((tool) => tool.name)),
+  };
+}
+
 // --- Responses non-stream response shape (subset we read) ---
 
 type ResponsesOutputText = { type: "output_text"; text: string };
@@ -258,11 +273,28 @@ function parseArgs(args: string): unknown {
   }
 }
 
+function validateFunctionName(
+  name: string | undefined,
+  context: ResponsesConversionContext,
+): string {
+  const shown = name || "<missing>";
+  if (!name || !context.advertisedToolNames.has(name)) {
+    const advertised = [...context.advertisedToolNames].sort().join(", ") || "none";
+    throw new Error(
+      `upstream returned unadvertised function '${shown}' (advertised functions: ${advertised})`,
+    );
+  }
+  return name;
+}
+
 // One Responses body -> one Anthropic Message. Walk output[]: skip reasoning,
 // concatenate output_text into one text block, and turn each function_call into a
 // tool_use block (input parsed back to an object). stop_reason upgrades to
 // tool_use whenever any function_call appears.
-export function mapResponsesResponse(res: ResponsesResponse): AnthropicResponse {
+export function mapResponsesResponse(
+  res: ResponsesResponse,
+  context: ResponsesConversionContext,
+): AnthropicResponse {
   const content: AnthropicResponseBlock[] = [];
   let sawTool = false;
   let text = "";
@@ -278,7 +310,7 @@ export function mapResponsesResponse(res: ResponsesResponse): AnthropicResponse 
       content.push({
         type: "tool_use",
         id: call.call_id,
-        name: call.name,
+        name: validateFunctionName(call.name, context),
         input: parseArgs(call.arguments),
       });
     }
@@ -301,89 +333,158 @@ export function mapResponsesResponse(res: ResponsesResponse): AnthropicResponse 
 
 // --- stream mapping ---
 
-// The Responses stream events we act on. Everything else (in_progress,
-// content_part.*, *.done closers, reasoning items) is ignored — the block
-// lifecycle is driven by the text/arg deltas and the terminal event.
+// Correlation fields vary between Responses events, so retain every stable id
+// the API may provide. Tool argument fragments are buffered per call because
+// Anthropic content blocks cannot legally interleave.
+type ResponsesStreamItem = {
+  type?: string;
+  id?: string;
+  call_id?: string;
+  name?: string;
+  arguments?: string;
+};
+
 type ResponsesStreamEvent = {
   type?: string;
   delta?: string;
-  item?: { type?: string; call_id?: string; name?: string };
+  arguments?: string;
+  output_index?: number;
+  item_id?: string;
+  call_id?: string;
+  item?: ResponsesStreamItem;
   response?: ResponsesResponse;
 };
 
-type RState = {
-  next: number; // next Anthropic content-block index to assign
-  openIndex: number; // index of the open block, or -1
-  openKind: "text" | "tool" | null;
+type PendingCall = {
+  callId: string;
+  name: string;
+  fragments: string[];
+  done: boolean;
 };
 
-function closeOpen(state: RState, events: AnthropicStreamEvent[]): void {
-  if (state.openKind === null) return;
-  events.push({ type: "content_block_stop", index: state.openIndex });
-  state.openIndex = -1;
-  state.openKind = null;
+type RState = {
+  next: number;
+  textIndex: number;
+  textOpen: boolean;
+  calls: PendingCall[];
+  callsByAlias: Map<string, PendingCall>;
+};
+
+function aliasesFor(ev: ResponsesStreamEvent): string[] {
+  const aliases: string[] = [];
+  const add = (alias: string | undefined) => {
+    if (alias && !aliases.includes(alias)) aliases.push(alias);
+  };
+  if (ev.output_index !== undefined) add(`output:${ev.output_index}`);
+  add(ev.item_id ? `item:${ev.item_id}` : undefined);
+  add(ev.call_id ? `call:${ev.call_id}` : undefined);
+  add(ev.item?.id ? `item:${ev.item.id}` : undefined);
+  add(ev.item?.call_id ? `call:${ev.item.call_id}` : undefined);
+  return aliases;
 }
 
-// Translate one Responses event into zero or more Anthropic SSE events. Pulled
-// out of the generator so it is a pure (state, event) -> events step, mirroring
-// chunkToEvents in response.ts. Mutates `state` for block bookkeeping.
-function eventToAnthropic(state: RState, ev: ResponsesStreamEvent): AnthropicStreamEvent[] {
-  const events: AnthropicStreamEvent[] = [];
+function registerCall(
+  state: RState,
+  ev: ResponsesStreamEvent,
+  context: ResponsesConversionContext,
+): void {
+  const callId = ev.item?.call_id;
+  if (!callId) throw new Error("upstream returned a function call without a call_id");
+  const call: PendingCall = {
+    callId,
+    name: validateFunctionName(ev.item?.name, context),
+    fragments: [],
+    done: false,
+  };
+  for (const alias of aliasesFor(ev)) {
+    if (state.callsByAlias.has(alias)) {
+      throw new Error(`upstream reused function-call identifier '${alias}'`);
+    }
+    state.callsByAlias.set(alias, call);
+  }
+  state.calls.push(call);
+}
 
-  switch (ev.type) {
-    case "response.output_text.delta": {
-      if (state.openKind !== "text") {
-        closeOpen(state, events);
-        state.openIndex = state.next++;
-        state.openKind = "text";
-        events.push({
-          type: "content_block_start",
-          index: state.openIndex,
-          content_block: { type: "text", text: "" },
-        });
-      }
-      if (ev.delta) {
-        events.push({
-          type: "content_block_delta",
-          index: state.openIndex,
-          delta: { type: "text_delta", text: ev.delta },
-        });
-      }
-      break;
+function resolveCall(state: RState, ev: ResponsesStreamEvent): PendingCall {
+  let matched: PendingCall | undefined;
+  for (const alias of aliasesFor(ev)) {
+    const call = state.callsByAlias.get(alias);
+    if (!call) throw new Error(`upstream referenced unknown function call '${alias}'`);
+    if (matched && matched !== call) {
+      throw new Error("upstream function-call identifiers refer to different calls");
     }
-    case "response.output_item.added": {
-      // Only function_call items open a block here; message/reasoning items are
-      // introduced lazily by their first text delta (above).
-      if (ev.item?.type === "function_call") {
-        closeOpen(state, events);
-        state.openIndex = state.next++;
-        state.openKind = "tool";
-        events.push({
-          type: "content_block_start",
-          index: state.openIndex,
-          content_block: {
-            type: "tool_use",
-            id: ev.item.call_id ?? "",
-            name: ev.item.name ?? "",
-            input: {},
-          },
-        });
-      }
-      break;
-    }
-    case "response.function_call_arguments.delta": {
-      if (state.openKind === "tool" && ev.delta) {
-        events.push({
-          type: "content_block_delta",
-          index: state.openIndex,
-          delta: { type: "input_json_delta", partial_json: ev.delta },
-        });
-      }
-      break;
+    matched = call;
+  }
+  if (matched) return matched;
+
+  let pending: PendingCall | undefined;
+  let pendingCount = 0;
+  for (const call of state.calls) {
+    if (!call.done) {
+      pending = call;
+      pendingCount++;
     }
   }
+  if (pendingCount === 1) return pending as PendingCall;
+  throw new Error(
+    `upstream function-call event is ambiguous (${pendingCount} pending calls and no correlation id)`,
+  );
+}
 
-  return events;
+function closeText(state: RState): AnthropicStreamEvent[] {
+  if (!state.textOpen) return [];
+  state.textOpen = false;
+  return [{ type: "content_block_stop", index: state.textIndex }];
+}
+
+function* emitCalls(state: RState): Generator<AnthropicStreamEvent> {
+  yield* closeText(state);
+  for (const call of state.calls) {
+    const index = state.next++;
+    yield {
+      type: "content_block_start",
+      index,
+      content_block: { type: "tool_use", id: call.callId, name: call.name, input: {} },
+    };
+    for (const fragment of call.fragments) {
+      if (fragment) {
+        yield {
+          type: "content_block_delta",
+          index,
+          delta: { type: "input_json_delta", partial_json: fragment },
+        };
+      }
+    }
+    yield { type: "content_block_stop", index };
+  }
+}
+
+function handleToolEvent(
+  state: RState,
+  ev: ResponsesStreamEvent,
+  context: ResponsesConversionContext,
+): void {
+  if (ev.type === "response.output_item.added" && ev.item?.type === "function_call") {
+    registerCall(state, ev, context);
+    return;
+  }
+  if (ev.type === "response.function_call_arguments.delta") {
+    const call = resolveCall(state, ev);
+    if (call.done) throw new Error(`upstream sent arguments after function call '${call.callId}' completed`);
+    if (ev.delta) call.fragments.push(ev.delta);
+    return;
+  }
+  const argumentsDone = ev.type === "response.function_call_arguments.done";
+  const itemDone = ev.type === "response.output_item.done" && ev.item?.type === "function_call";
+  if (argumentsDone || itemDone) {
+    const call = resolveCall(state, ev);
+    const args = argumentsDone ? ev.arguments ?? ev.item?.arguments : ev.item?.arguments;
+    if (call.fragments.length === 0 && args) call.fragments.push(args);
+    // Responses normally emits both arguments.done and output_item.done for one
+    // call. Treat the second closer as idempotent while still rejecting deltas
+    // that arrive after either closer.
+    call.done = true;
+  }
 }
 
 // Responses SSE event stream -> Anthropic SSE event stream. Opens with
@@ -403,13 +504,19 @@ function eventToAnthropic(state: RState, ev: ResponsesStreamEvent): AnthropicStr
 export async function* streamResponsesResponse(
   events: AsyncIterable<ResponsesStreamEvent>,
   model: string,
-  inputTokensEstimate = 0,
+  inputTokensEstimate: number,
+  context: ResponsesConversionContext,
 ): AsyncGenerator<AnthropicStreamEvent> {
   const id = newMessageId();
-  const state: RState = { next: 0, openIndex: -1, openKind: null };
+  const state: RState = {
+    next: 0,
+    textIndex: -1,
+    textOpen: false,
+    calls: [],
+    callsByAlias: new Map(),
+  };
   let usage: ResponsesUsage | undefined;
   let stopReason: AnthropicStopReason = "end_turn";
-  let sawTool = false;
   let started = false;
 
   const start = function* (): Generator<AnthropicStreamEvent> {
@@ -433,32 +540,44 @@ export async function* streamResponsesResponse(
   };
 
   for await (const ev of events) {
-    // Terminal events carry the final response object (status + usage).
     if (
       ev.type === "response.completed" ||
       ev.type === "response.incomplete" ||
       ev.type === "response.failed"
     ) {
       if (ev.response?.usage) usage = ev.response.usage;
-      if (ev.response) stopReason = stopReasonFor(ev.response, sawTool);
+      if (ev.response) stopReason = stopReasonFor(ev.response, state.calls.length > 0);
       continue;
     }
     if (ev.type === "response.created" && ev.response?.usage) usage = ev.response.usage;
-    if (ev.type === "response.output_item.added" && ev.item?.type === "function_call") {
-      sawTool = true;
+
+    if (ev.type === "response.output_text.delta" && ev.delta) {
+      yield* start();
+      if (!state.textOpen) {
+        state.textIndex = state.next++;
+        state.textOpen = true;
+        yield {
+          type: "content_block_start",
+          index: state.textIndex,
+          content_block: { type: "text", text: "" },
+        };
+      }
+      yield {
+        type: "content_block_delta",
+        index: state.textIndex,
+        delta: { type: "text_delta", text: ev.delta },
+      };
+      continue;
     }
 
-    const mapped = eventToAnthropic(state, ev);
-    if (mapped.length) {
-      yield* start();
-      yield* mapped;
-    }
+    handleToolEvent(state, ev, context);
   }
 
-  // A stream that produced nothing still needs a well-formed envelope.
+  // Tool calls are buffered so interleaved upstream fragments become legal,
+  // contiguous Anthropic content blocks in upstream addition order.
   yield* start();
-  if (state.openKind !== null) yield { type: "content_block_stop", index: state.openIndex };
-  if (sawTool) stopReason = "tool_use";
+  yield* emitCalls(state);
+  if (state.calls.length) stopReason = "tool_use";
 
   yield {
     type: "message_delta",

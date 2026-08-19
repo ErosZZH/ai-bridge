@@ -11,12 +11,15 @@ import {
   __setResponseDeps,
   mapResponse,
   streamResponse,
+  createResponsesConversionContext,
   mapResponsesResponse,
   streamResponsesResponse,
   type OpenAIResponse,
   type OpenAIStreamChunk,
   type AnthropicStreamEvent,
 } from "./index.js";
+
+const noResponsesTools = createResponsesConversionContext({ model: "gpt-5.5", input: [] });
 
 __setResponseDeps({ id: () => "msg_usage" });
 
@@ -158,7 +161,7 @@ test("mapResponsesResponse maps cached_tokens to cache_read; cache_creation is a
     output: [{ type: "message", role: "assistant", content: [{ type: "output_text", text: "hi" }] }],
     usage: { input_tokens: 80, output_tokens: 12, input_tokens_details: { cached_tokens: 50 } },
   };
-  const msg = mapResponsesResponse(res as never);
+  const msg = mapResponsesResponse(res as never, noResponsesTools);
   // input_tokens (80) is cache-inclusive; subtract the cached subset: 80 - 50 = 30.
   assert.equal(msg.usage.input_tokens, 30);
   assert.equal(msg.usage.output_tokens, 12);
@@ -175,7 +178,7 @@ test("streamResponsesResponse takes authoritative usage from the terminal event"
     { type: "response.output_text.delta", delta: "hi" },
     { type: "response.completed", response: { status: "completed", usage: { input_tokens: 70, output_tokens: 9, input_tokens_details: { cached_tokens: 40 } } } },
   ];
-  const out = await collect(streamResponsesResponse(iter(events) as never, "gpt-5.5"));
+  const out = await collect(streamResponsesResponse(iter(events) as never, "gpt-5.5", 0, noResponsesTools));
 
   const start = out.find((e) => e.type === "message_start");
   assert.ok(start && start.type === "message_start");
@@ -209,7 +212,7 @@ test("responses usage does not double-count cache reads (harness four-counter su
     output: [{ type: "message", role: "assistant", content: [{ type: "output_text", text: "ok" }] }],
     usage: { input_tokens: 15141, output_tokens: 192, input_tokens_details: { cached_tokens: 14848 } },
   };
-  const u = mapResponsesResponse(res as never).usage;
+  const u = mapResponsesResponse(res as never, noResponsesTools).usage;
   // Cache-exclusive input: 15141 - 14848 = 293.
   assert.equal(u.input_tokens, 293);
   assert.equal(u.cache_read_input_tokens, 14848);
