@@ -1,7 +1,9 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
+import { __setAuthDeps } from "../auth/index.js";
 import { __setCopilotDeps } from "../copilot/index.js";
+import { __setResponsesDeps } from "../copilot/responses.js";
 import { __setResponseDeps } from "../convert/index.js";
 import { Logger } from "../obs/index.js";
 import type { SearchConfig } from "../config.js";
@@ -136,6 +138,58 @@ test("findWebSearchTool returns undefined when absent", () => {
 });
 
 // --- single search, non-stream ----------------------------------------------
+
+test("Responses web_search loop authorizes only mapped request tools", async () => {
+  pinIds();
+  const { search, queries } = fakeSearch(1);
+  __setSearchDeps({ search });
+  __setAuthDeps({
+    readTokens: () => [{ token: "oauth", user: "test" }],
+    fetch: async () => new Response(JSON.stringify({ token: "bearer", expires_at: 9999999999 }), {
+      status: 200,
+      headers: { "content-type": "application/json" },
+    }),
+  });
+  const queue = [
+    {
+      id: "r1",
+      model: "gpt-5.5",
+      status: "completed",
+      output: [{ type: "function_call", call_id: "call_1", name: "web_search", arguments: '{"query":"q"}' }],
+      usage: { input_tokens: 5, output_tokens: 2 },
+    },
+    {
+      id: "r2",
+      model: "gpt-5.5",
+      status: "completed",
+      output: [{ type: "message", role: "assistant", content: [{ type: "output_text", text: "answer" }] }],
+      usage: { input_tokens: 5, output_tokens: 2 },
+    },
+  ];
+  __setResponsesDeps({ fetch: async () => new Response(JSON.stringify(queue.shift()), {
+    status: 200,
+    headers: { "content-type": "application/json" },
+  }) });
+
+  const outcome = await runWebSearchLoop(args({ endpoint: "responses", inbound: { ...args().inbound, model: "gpt-5.5" } }));
+  assert.deepEqual(queries, ["q"]);
+  assert.deepEqual(outcome.blocks.map((block) => block.type), [
+    "server_tool_use",
+    "web_search_tool_result",
+    "text",
+  ]);
+
+  __setResponsesDeps({ fetch: async () => new Response(JSON.stringify({
+    id: "bad",
+    model: "gpt-5.5",
+    status: "completed",
+    output: [{ type: "function_call", call_id: "call_bad", name: "parallel", arguments: "{}" }],
+  }), { status: 200, headers: { "content-type": "application/json" } }) });
+  await assert.rejects(
+    () => runWebSearchLoop(args({ endpoint: "responses", inbound: { ...args().inbound, model: "gpt-5.5" } })),
+    /unadvertised function 'parallel'/,
+  );
+});
 
 test("single search non-stream: block order + paired ids + item fields", async () => {
   pinIds();

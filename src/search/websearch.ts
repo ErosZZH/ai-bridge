@@ -36,6 +36,7 @@ import {
   type ResponsesResponse,
   mapRequest,
   mapResponse,
+  createResponsesConversionContext,
   mapRequestToResponses,
   mapResponsesResponse,
   newMessageId,
@@ -122,7 +123,7 @@ export async function internalComplete(
   if (endpoint === "responses") {
     const req = mapRequestToResponses(body);
     const res = (await responsesCompletion(req, signal)) as ResponsesResponse;
-    return mapResponsesResponse(res);
+    return mapResponsesResponse(res, createResponsesConversionContext(req));
   }
   const openai = mapRequest(body);
   const res = (await chatCompletion(openai, signal)) as unknown as OpenAIResponse;

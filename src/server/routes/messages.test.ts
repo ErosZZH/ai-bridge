@@ -370,6 +370,92 @@ test("POST /v1/messages routes a /responses-only model through the Responses pat
   assert.equal(sent.max_output_tokens, 128000);
 });
 
+test("POST /v1/messages (responses) rejects an unadvertised function", async () => {
+  let calls = 0;
+  const server = appWithResponses(async () => {
+    calls++;
+    return json({
+      id: "resp-bad",
+      model: "gpt-5.5",
+      status: "completed",
+      output: [{ type: "function_call", call_id: "call_bad", name: "parallel", arguments: "{}" }],
+    });
+  });
+
+  const res = await post(server, "/v1/messages", {
+    model: "gpt-5.5",
+    tools: [{ name: "get_weather", input_schema: { type: "object" } }],
+    messages: [{ role: "user", content: "weather?" }],
+  });
+  assert.equal(res.status, 500);
+  assert.equal(calls, 1);
+  const body = (await res.json()) as { error: { type: string; message: string } };
+  assert.equal(body.error.type, "api_error");
+  assert.match(body.error.message, /unadvertised function 'parallel'/);
+});
+
+test("POST /v1/messages (responses) stream rejects an unadvertised function", async () => {
+  const server = appWithResponses(async () =>
+    sse([
+      {
+        type: "response.output_item.added",
+        item: { type: "function_call", call_id: "call_bad", name: "parallel" },
+      },
+    ]),
+  );
+  const res = await post(server, "/v1/messages", {
+    model: "gpt-5.5",
+    stream: true,
+    tools: [{ name: "get_weather", input_schema: { type: "object" } }],
+    messages: [{ role: "user", content: "weather?" }],
+  });
+  assert.equal(res.status, 200);
+  const text = await res.text();
+  assert.match(text, /^event: error$/m);
+  assert.match(text, /unadvertised function 'parallel'/);
+  assert.doesNotMatch(text, /"type":"tool_use"/);
+  assert.doesNotMatch(text, /^event: message_stop$/m);
+});
+
+test("POST /v1/messages (responses) stream keeps interleaved tool arguments separate", async () => {
+  const server = appWithResponses(async () =>
+    sse([
+      { type: "response.output_item.added", output_index: 0, item: { type: "function_call", id: "i1", call_id: "c1", name: "first" } },
+      { type: "response.output_item.added", output_index: 1, item: { type: "function_call", id: "i2", call_id: "c2", name: "second" } },
+      { type: "response.function_call_arguments.delta", output_index: 0, delta: '{"a":' },
+      { type: "response.function_call_arguments.delta", output_index: 1, delta: '{"b":' },
+      { type: "response.function_call_arguments.delta", item_id: "i2", delta: "2}" },
+      { type: "response.function_call_arguments.delta", item_id: "i1", delta: "1}" },
+      { type: "response.completed", response: { status: "completed" } },
+    ]),
+  );
+  const res = await post(server, "/v1/messages", {
+    model: "gpt-5.5",
+    stream: true,
+    tools: [
+      { name: "first", input_schema: { type: "object" } },
+      { name: "second", input_schema: { type: "object" } },
+    ],
+    messages: [{ role: "user", content: "call both" }],
+  });
+  const text = await res.text();
+  assert.doesNotMatch(text, /^event: error$/m);
+  assert.match(text, /"id":"c1","name":"first"/);
+  assert.match(text, /"id":"c2","name":"second"/);
+  const payloads = text
+    .split("\n")
+    .filter((line) => line.startsWith("data: "))
+    .map((line) => JSON.parse(line.slice(6)) as any);
+  const byIndex = new Map<string, string>();
+  for (const event of payloads) {
+    if (event.type !== "content_block_delta" || event.delta.type !== "input_json_delta") continue;
+    const index = String(event.index);
+    byIndex.set(index, (byIndex.get(index) ?? "") + event.delta.partial_json);
+  }
+  assert.deepEqual([...byIndex.values()], ['{"a":1}', '{"b":2}']);
+  assert.match(text, /"stop_reason":"tool_use"/);
+});
+
 test("POST /v1/messages (responses) stream -> Anthropic SSE lifecycle", async () => {
   const events = [
     { type: "response.created", response: { id: "r1" } },
