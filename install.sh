@@ -456,7 +456,7 @@ EOF
   stop:    systemctl --user stop $SERVICE_NAME
   start:   systemctl --user start $SERVICE_NAME
   logs:    journalctl --user -u $SERVICE_NAME -f   (app logs: $LOG_DIR)
-  remove:  ./install.sh uninstall
+  remove:  ./uninstall.sh
 EOF
       ;;
     Darwin)
@@ -465,7 +465,7 @@ EOF
   stop:    launchctl unload -w $PLIST_FILE
   start:   launchctl load -w $PLIST_FILE
   logs:    tail -f $LOG_DIR/launchd.err.log   (app logs: $LOG_DIR)
-  remove:  ./install.sh uninstall
+  remove:  ./uninstall.sh
 EOF
       ;;
   esac

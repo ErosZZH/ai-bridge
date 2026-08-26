@@ -781,7 +781,7 @@ Manage the service:
   stop:    Stop-ScheduledTask -TaskName $TaskName
   start:   Start-ScheduledTask -TaskName $TaskName
   logs:    %USERPROFILE%\.ai-bridge\logs
-  remove:  .\install.ps1 -Uninstall
+  remove:  .\uninstall.ps1
 
 (`ai-bridge` resolves in a new terminal -- the installer just added it to PATH.)
 "@

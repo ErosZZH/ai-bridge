@@ -138,11 +138,11 @@ Claude Code expects, so answers still end with a **Sources:** section.
 ## Uninstall
 
 ```bash
-./install.sh uninstall      # Linux / macOS
+./uninstall.sh              # Linux / macOS
 ```
 
 ```powershell
-.\install.ps1 -Uninstall    # Windows
+.\uninstall.ps1             # Windows
 ```
 
 This stops and removes the service and the `ai-bridge` CLI wrapper. Your build output (`dist/`) and Claude Code config (`~/.claude/settings.json`) are left untouched.
