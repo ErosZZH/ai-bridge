@@ -17,7 +17,7 @@ function toolContext(...names: string[]) {
   return createResponsesConversionContext({
     model: "gpt-5.5",
     input: [],
-    tools: names.map((name) => ({ type: "function", name, description: "", parameters: {} })),
+    tools: names.map((name) => ({ type: "function", name, description: "", parameters: {}, strict: false })),
   });
 }
 
@@ -59,9 +59,58 @@ test("tools are flat (name at top level), tool_choice flattened", () => {
     tool_choice: { type: "tool", name: "get_weather" },
   });
   assert.deepEqual(out.tools, [
-    { type: "function", name: "get_weather", description: "w", parameters: { type: "object" } },
+    { type: "function", name: "get_weather", description: "w", parameters: { type: "object" }, strict: false },
   ]);
   assert.deepEqual(out.tool_choice, { type: "function", name: "get_weather" });
+});
+
+test("Responses tools opt out of strict normalization and preserve optional fields", () => {
+  const tools = [
+    {
+      name: "Agent",
+      input_schema: {
+        type: "object",
+        properties: {
+          description: { type: "string" },
+          prompt: { type: "string" },
+          isolation: { type: "string", enum: ["worktree", "remote"] },
+        },
+        required: ["description", "prompt"],
+      },
+    },
+    {
+      name: "Monitor",
+      input_schema: {
+        type: "object",
+        properties: {
+          description: { type: "string" },
+          command: { type: "string" },
+          ws: {
+            type: "object",
+            properties: {
+              url: { type: "string" },
+              protocols: { type: "array", items: { type: "string" } },
+            },
+            required: ["url"],
+          },
+        },
+        required: ["description"],
+      },
+    },
+  ];
+  const originalTools = structuredClone(tools);
+  const out = mapRequestToResponses({ model: "gpt-5.5", messages: [], tools });
+
+  // Check the serialized payload too: false must not be omitted as a falsy value.
+  assert.deepEqual(JSON.parse(JSON.stringify(out)).tools, originalTools.map((tool) => ({
+    type: "function",
+    name: tool.name,
+    description: "",
+    parameters: tool.input_schema,
+    strict: false,
+  })));
+  // Neither required lists nor nested schemas gain defaults or placeholders.
+  assert.deepEqual(tools, originalTools);
 });
 
 test("tool_use/tool_result blocks -> function_call / function_call_output items", () => {

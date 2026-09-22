@@ -44,6 +44,7 @@ export type ResponsesTool = {
   name: string;
   description: string;
   parameters: unknown;
+  strict: boolean;
 };
 
 export type ResponsesToolChoice =
@@ -193,6 +194,8 @@ function mapResponsesTools(tools?: AnthropicTool[]): ResponsesTool[] | undefined
     name: t.name,
     description: t.description ?? "",
     parameters: t.input_schema,
+    // Responses may normalize omitted strict mode, making optional fields required.
+    strict: false,
   }));
 }
 
