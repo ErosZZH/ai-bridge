@@ -34,10 +34,15 @@ import {
 
 // --- Responses request shape (subset we emit) ---
 
+export type ResponsesInputText = { type: "input_text"; text: string };
+export type ResponsesInputImage = { type: "input_image"; image_url: string; detail: "auto" };
+export type ResponsesInputContent = ResponsesInputText | ResponsesInputImage;
+
 export type ResponsesInputItem =
-  | { role: "user" | "assistant" | "system"; content: string }
+  | { role: "user"; content: string | ResponsesInputContent[] }
+  | { role: "assistant" | "system"; content: string }
   | { type: "function_call"; call_id: string; name: string; arguments: string }
-  | { type: "function_call_output"; call_id: string; output: string };
+  | { type: "function_call_output"; call_id: string; output: string | ResponsesInputContent[] };
 
 export type ResponsesTool = {
   type: "function";
@@ -128,17 +133,14 @@ function mapInstructions(system: AnthropicRequest["system"]): string | undefined
   return text.length ? text : undefined;
 }
 
-// Images and documents become their reference url inline (same pragmatic choice
-// the chat mapper makes: no base64 tokenization).
-function refUrl(source: AnthropicSource): string {
-  return sourceUrl(source);
+function inputImage(source: AnthropicSource): ResponsesInputImage {
+  return { type: "input_image", image_url: sourceUrl(source), detail: "auto" };
 }
 
 // One Anthropic message -> zero or more Responses input items. tool_use blocks
 // become `function_call` items, tool_result blocks become `function_call_output`
-// items (both keyed by the same call id), and the remaining text/media collapse
-// to a single role item. Mirrors how the chat mapper fans 1->N, in Responses
-// item vocabulary.
+// items (both keyed by the same call id). User images retain typed content in
+// original block order; turns without images keep the existing string shape.
 function mapInput(messages: AnthropicMessage[]): ResponsesInputItem[] {
   const out: ResponsesInputItem[] = [];
 
@@ -148,15 +150,17 @@ function mapInput(messages: AnthropicMessage[]): ResponsesInputItem[] {
       continue;
     }
 
-    const text: string[] = [];
+    const parts: ResponsesInputContent[] = [];
     const calls: ResponsesInputItem[] = [];
     const results: ResponsesInputItem[] = [];
 
     for (const block of msg.content) {
       if (block.type === "text") {
-        text.push(block.text);
+        parts.push({ type: "input_text", text: block.text });
+      } else if (block.type === "image" && msg.role === "user") {
+        parts.push(inputImage(block.source));
       } else if (block.type === "image" || block.type === "document") {
-        text.push(refUrl(block.source));
+        parts.push({ type: "input_text", text: sourceUrl(block.source) });
       } else if (block.type === "tool_use") {
         calls.push({
           type: "function_call",
@@ -173,8 +177,12 @@ function mapInput(messages: AnthropicMessage[]): ResponsesInputItem[] {
       }
     }
 
-    const joined = text.join("\n");
-    if (joined.length) out.push({ role: msg.role, content: joined });
+    if (msg.role === "user" && parts.some((part) => part.type === "input_image")) {
+      out.push({ role: "user", content: parts });
+    } else {
+      const joined = parts.filter((part) => part.type === "input_text").map((part) => part.text).join("\n");
+      if (joined.length) out.push({ role: msg.role, content: joined });
+    }
     // function_call items belong to the assistant turn; outputs answer the prior
     // call. Emit calls then results, after any text, preserving turn order.
     out.push(...calls, ...results);
@@ -183,7 +191,14 @@ function mapInput(messages: AnthropicMessage[]): ResponsesInputItem[] {
   return out;
 }
 
-function toolResult(content: AnthropicToolResultBlock["content"]): string {
+function toolResult(content: AnthropicToolResultBlock["content"]): string | ResponsesInputContent[] {
+  if (Array.isArray(content) && content.some((part) => part.type === "image")) {
+    return content.flatMap((part): ResponsesInputContent[] => {
+      if (part.type === "text") return [{ type: "input_text", text: part.text }];
+      if (part.type === "image") return [inputImage(part.source)];
+      return [];
+    });
+  }
   return toolResultText(content);
 }
 

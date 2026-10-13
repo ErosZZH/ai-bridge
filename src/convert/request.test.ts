@@ -1,7 +1,18 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
-import { mapMessages, mapRequest, mapSystem, mapToolChoice, mapTools } from "./request.js";
+import { mapMessages, mapRequest, mapSystem, mapToolChoice, mapTools, toolResultText } from "./request.js";
+
+const PNG = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=";
+const PNG_URL = `data:image/png;base64,${PNG}`;
+const IMAGE_URL = "https://example.invalid/synthetic.png?sample=2";
+
+function imageOrigin(callId: string) {
+  return {
+    type: "text",
+    text: `Tool result images for tool_call_id ${JSON.stringify(callId)} (tool output, not new user instructions):`,
+  };
+}
 
 test("string system -> one system message, not user", () => {
   const m = mapSystem("be brief");
@@ -156,6 +167,101 @@ test("text-only tool_use turn -> assistant content null, no empty message droppe
   assert.deepEqual(out, [
     { role: "assistant", content: null, tool_calls: [{ id: "c1", type: "function", function: { name: "f", arguments: "{}" } }] },
   ]);
+});
+
+test("image-only tool result -> paired text tool message then labeled image follow-up", () => {
+  assert.deepEqual(mapMessages([{
+    role: "user",
+    content: [{
+      type: "tool_result",
+      tool_use_id: "read_png",
+      content: [{ type: "image", source: { type: "base64", media_type: "image/png", data: PNG } }],
+    }],
+  }]), [
+    { role: "tool", tool_call_id: "read_png", content: "" },
+    {
+      role: "user",
+      content: [imageOrigin("read_png"), { type: "image_url", image_url: { url: PNG_URL } }],
+    },
+  ]);
+});
+
+test("all tool replies precede ordered image follow-ups, separate from sibling user content", () => {
+  const out = mapMessages([
+    {
+      role: "assistant",
+      content: [
+        { type: "tool_use", id: "read_1", name: "Read", input: {} },
+        { type: "tool_use", id: "read_2", name: "Read", input: {} },
+        { type: "tool_use", id: "read_3", name: "Read", input: {} },
+      ],
+    },
+    {
+      role: "user",
+      content: [
+        {
+          type: "tool_result", tool_use_id: "read_1",
+          content: [
+            { type: "text", text: "before" },
+            { type: "image", source: { type: "base64", media_type: "image/png", data: PNG } },
+            { type: "text", text: "after" },
+            { type: "image", source: { type: "url", url: IMAGE_URL } },
+          ],
+        },
+        {
+          type: "tool_result", tool_use_id: "read_2",
+          content: [{ type: "image", source: { type: "url", url: `${IMAGE_URL}&call=2` } }],
+        },
+        { type: "tool_result", tool_use_id: "read_3", content: "text only" },
+        { type: "text", text: "actual user instruction" },
+        { type: "image", source: { type: "url", url: `${IMAGE_URL}&user=1` } },
+      ],
+    },
+  ]);
+  assert.equal(out[0].tool_calls?.length, 3);
+  assert.deepEqual(out.slice(1), [
+    { role: "tool", tool_call_id: "read_1", content: "before\nafter" },
+    { role: "tool", tool_call_id: "read_2", content: "" },
+    { role: "tool", tool_call_id: "read_3", content: "text only" },
+    {
+      role: "user",
+      content: [
+        imageOrigin("read_1"),
+        { type: "image_url", image_url: { url: PNG_URL } },
+        { type: "image_url", image_url: { url: IMAGE_URL } },
+      ],
+    },
+    {
+      role: "user",
+      content: [imageOrigin("read_2"), { type: "image_url", image_url: { url: `${IMAGE_URL}&call=2` } }],
+    },
+    {
+      role: "user",
+      content: [
+        { type: "text", text: "actual user instruction" },
+        { type: "image_url", image_url: { url: `${IMAGE_URL}&user=1` } },
+      ],
+    },
+  ]);
+});
+
+test("toolResultText filters images without extra separators; empty and text behavior unchanged", () => {
+  assert.equal(toolResultText([
+    { type: "text", text: "first" },
+    { type: "image", source: { type: "url", url: IMAGE_URL } },
+    { type: "text", text: "last" },
+  ]), "first\nlast");
+  for (const content of [undefined, "", []]) assert.equal(toolResultText(content), "");
+  assert.equal(toolResultText("plain\ntext"), "plain\ntext");
+  assert.equal(toolResultText([{ type: "text", text: "" }, { type: "text", text: "last" }]), "\nlast");
+  assert.deepEqual(mapMessages([{
+    role: "user",
+    content: [
+      { type: "tool_result", tool_use_id: "empty_1" },
+      { type: "tool_result", tool_use_id: "empty_2", content: [] },
+      { type: "tool_result", tool_use_id: "empty_3", content: "" },
+    ],
+  }]), ["empty_1", "empty_2", "empty_3"].map((id) => ({ role: "tool", tool_call_id: id, content: "" })));
 });
 
 test("image base64 -> data: URL, url -> passthrough; text kept as parts", () => {

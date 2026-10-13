@@ -30,16 +30,21 @@ test("withClaudeCode1mSuffix tags only in-band windows", () => {
   assert.equal(withClaudeCode1mSuffix("gpt-5.5[1m]", 936000), "gpt-5.5[1m]");
 });
 
-// Run a body with HOME pointed at a throwaway dir so the real ~/.claude is untouched.
+// Windows homedir uses USERPROFILE; isolate both home variables before any write.
 function withTempHome(body: () => void) {
   const dir = mkdtempSync(join(tmpdir(), "ai-bridge-home-"));
   const prev = process.env.HOME;
+  const prevProfile = process.env.USERPROFILE;
   process.env.HOME = dir;
+  process.env.USERPROFILE = dir;
   try {
+    assert.equal(claudeSettingsPath(), join(dir, ".claude", "settings.json"));
     body();
   } finally {
     if (prev === undefined) delete process.env.HOME;
     else process.env.HOME = prev;
+    if (prevProfile === undefined) delete process.env.USERPROFILE;
+    else process.env.USERPROFILE = prevProfile;
     rmSync(dir, { recursive: true, force: true });
   }
 }

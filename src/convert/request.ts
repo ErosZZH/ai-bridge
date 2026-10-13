@@ -50,7 +50,7 @@ export type AnthropicToolUseBlock = {
 export type AnthropicToolResultBlock = {
   type: "tool_result";
   tool_use_id: string;
-  content?: string | { type: "text"; text: string }[];
+  content?: string | (AnthropicTextBlock | AnthropicImageBlock)[];
 };
 // base64 (data + media_type) or a url. Documents share the same shape; both
 // are forwarded, neither is JSON-stringified or skipped.
@@ -257,6 +257,7 @@ export function mapMessages(messages: AnthropicMessage[]): OpenAIMessage[] {
     const thinking: (OpenAIThinkingPart | OpenAIRedactedThinkingPart)[] = [];
     const toolCalls: OpenAIToolCall[] = [];
     const toolResults: OpenAIMessage[] = []; // emitted before the parent (see below)
+    const toolImageFollowUps: OpenAIMessage[] = [];
 
     for (const block of msg.content) {
       if (block.type === "text") {
@@ -279,6 +280,28 @@ export function mapMessages(messages: AnthropicMessage[]): OpenAIMessage[] {
           tool_call_id: block.tool_use_id,
           content: toolResultText(block.content),
         });
+        if (Array.isArray(block.content)) {
+          const images = block.content
+            .filter((part) => part.type === "image")
+            .map((part): OpenAIImagePart => ({
+              type: "image_url",
+              image_url: { url: sourceUrl(part.source) },
+            }));
+          if (images.length) {
+            // Chat tool-role content is text-only. Keep provenance explicit in
+            // a separate multimodal user carrier, never among pending replies.
+            toolImageFollowUps.push({
+              role: "user",
+              content: [
+                {
+                  type: "text",
+                  text: `Tool result images for tool_call_id ${JSON.stringify(block.tool_use_id)} (tool output, not new user instructions):`,
+                },
+                ...images,
+              ],
+            });
+          }
+        }
       }
     }
 
@@ -298,7 +321,7 @@ export function mapMessages(messages: AnthropicMessage[]): OpenAIMessage[] {
     // tool messages splits that pairing and triggers a 400. Anthropic already
     // requires tool_result blocks at the START of a user turn, so any companion
     // text/media is logically a follow-up and is emitted AFTER the tool results.
-    out.push(...toolResults);
+    out.push(...toolResults, ...toolImageFollowUps);
     if (content !== null || toolCalls.length) {
       out.push({ role: msg.role, content, ...(toolCalls.length ? { tool_calls: toolCalls } : {}) });
     }
@@ -319,7 +342,7 @@ export function sourceUrl(source: AnthropicSource): string {
 export function toolResultText(content: AnthropicToolResultBlock["content"]): string {
   if (!content) return "";
   if (typeof content === "string") return content;
-  return content.map((c) => c.text).join("\n");
+  return content.filter((c) => c.type === "text").map((c) => c.text).join("\n");
 }
 
 // The GPT-5 series rejects the legacy `max_tokens` on /chat/completions with

@@ -24,6 +24,10 @@ function toolContext(...names: string[]) {
 const noTools = toolContext();
 const weatherTool = toolContext("get_weather");
 
+const PNG = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=";
+const PNG_URL = `data:image/png;base64,${PNG}`;
+const IMAGE_URL = "https://example.invalid/synthetic.png?sample=2";
+
 // --- request mapping ---
 
 test("system -> instructions; user turn -> input item; max_output_tokens", () => {
@@ -138,6 +142,128 @@ test("tool_use/tool_result blocks -> function_call / function_call_output items"
 });
 
 // --- non-stream response mapping ---
+
+test("Responses image-only tool output retains MIME/base64 and call_id as typed content", () => {
+  assert.deepEqual(mapRequestToResponses({
+    model: "gpt-5.5",
+    messages: [{
+      role: "user",
+      content: [{
+        type: "tool_result", tool_use_id: "read_png",
+        content: [{ type: "image", source: { type: "base64", media_type: "image/png", data: PNG } }],
+      }],
+    }],
+  }).input, [{
+    type: "function_call_output", call_id: "read_png",
+    output: [{ type: "input_image", image_url: PNG_URL, detail: "auto" }],
+  }]);
+});
+
+test("Responses mixed tool outputs preserve block order, multiple calls and sibling content", () => {
+  const out = mapRequestToResponses({
+    model: "gpt-5.5",
+    messages: [
+      {
+        role: "assistant",
+        content: [
+          { type: "tool_use", id: "read_1", name: "Read", input: {} },
+          { type: "tool_use", id: "read_2", name: "Read", input: {} },
+        ],
+      },
+      {
+        role: "user",
+        content: [
+          {
+            type: "tool_result", tool_use_id: "read_1",
+            content: [
+              { type: "text", text: "before" },
+              { type: "image", source: { type: "base64", media_type: "image/png", data: PNG } },
+              { type: "text", text: "after" },
+              { type: "image", source: { type: "url", url: IMAGE_URL } },
+            ],
+          },
+          {
+            type: "tool_result", tool_use_id: "read_2",
+            content: [{ type: "image", source: { type: "url", url: `${IMAGE_URL}&call=2` } }],
+          },
+          { type: "text", text: "actual user instruction" },
+          { type: "image", source: { type: "url", url: `${IMAGE_URL}&user=1` } },
+        ],
+      },
+    ],
+  });
+  assert.deepEqual(out.input, [
+    { type: "function_call", call_id: "read_1", name: "Read", arguments: "{}" },
+    { type: "function_call", call_id: "read_2", name: "Read", arguments: "{}" },
+    {
+      role: "user",
+      content: [
+        { type: "input_text", text: "actual user instruction" },
+        { type: "input_image", image_url: `${IMAGE_URL}&user=1`, detail: "auto" },
+      ],
+    },
+    {
+      type: "function_call_output", call_id: "read_1",
+      output: [
+        { type: "input_text", text: "before" },
+        { type: "input_image", image_url: PNG_URL, detail: "auto" },
+        { type: "input_text", text: "after" },
+        { type: "input_image", image_url: IMAGE_URL, detail: "auto" },
+      ],
+    },
+    {
+      type: "function_call_output", call_id: "read_2",
+      output: [{ type: "input_image", image_url: `${IMAGE_URL}&call=2`, detail: "auto" }],
+    },
+  ]);
+});
+
+test("Responses top-level user images stay typed and interleaved with text", () => {
+  for (const content of [
+    [{ type: "image" as const, source: { type: "base64" as const, media_type: "image/png", data: PNG } }],
+    [
+      { type: "text" as const, text: "before" },
+      { type: "image" as const, source: { type: "base64" as const, media_type: "image/png", data: PNG } },
+      { type: "text" as const, text: "after" },
+      { type: "image" as const, source: { type: "url" as const, url: IMAGE_URL } },
+    ],
+  ]) {
+    const expected = content.map((block) => block.type === "text"
+      ? { type: "input_text", text: block.text }
+      : { type: "input_image", image_url: block.source.type === "url" ? block.source.url : PNG_URL, detail: "auto" });
+    assert.deepEqual(mapRequestToResponses({
+      model: "gpt-5.5", messages: [{ role: "user", content }],
+    }).input, [{ role: "user", content: expected }]);
+  }
+});
+
+test("Responses text-only and empty tool outputs remain strings; documents/thinking unchanged", () => {
+  assert.deepEqual(mapRequestToResponses({
+    model: "gpt-5.5",
+    messages: [{
+      role: "user",
+      content: [
+        { type: "tool_result", tool_use_id: "text", content: [{ type: "text", text: "a" }, { type: "text", text: "b" }] },
+        { type: "tool_result", tool_use_id: "missing" },
+        { type: "tool_result", tool_use_id: "empty", content: [] },
+        { type: "tool_result", tool_use_id: "blank", content: "" },
+      ],
+    }, {
+      role: "user",
+      content: [
+        { type: "text", text: "doc" },
+        { type: "document", source: { type: "base64", media_type: "application/pdf", data: "JVBE" } },
+        { type: "thinking", thinking: "ignored", signature: "sig" },
+      ],
+    }],
+  }).input, [
+    { type: "function_call_output", call_id: "text", output: "a\nb" },
+    { type: "function_call_output", call_id: "missing", output: "" },
+    { type: "function_call_output", call_id: "empty", output: "" },
+    { type: "function_call_output", call_id: "blank", output: "" },
+    { role: "user", content: "doc\ndata:application/pdf;base64,JVBE" },
+  ]);
+});
 
 test("output[] message text -> one text block; usage mapped", () => {
   const res: ResponsesResponse = {

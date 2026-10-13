@@ -4,7 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 
-import { CopilotAuthError, readGitHubTokens, writeGitHubToken } from "./index.js";
+import { CopilotAuthError, findCopilotConfigDirs, readGitHubTokens, writeGitHubToken } from "./index.js";
 import { COPILOT_CLIENT_ID, type DeviceCode, pollForToken } from "./device.js";
 
 function jsonResponse(body: unknown, status = 200): Response {
@@ -85,9 +85,12 @@ test("pollForToken gives up once expiresIn elapses", async () => {
 
 test("writeGitHubToken round-trips and preserves existing keys", () => {
   const dir = mkdtempSync(join(tmpdir(), "ai-bridge-auth-"));
-  const prevXdg = process.env.XDG_CONFIG_HOME;
-  process.env.XDG_CONFIG_HOME = dir;
+  // Windows uses AppData, not XDG_CONFIG_HOME, for the real credential store.
+  const keys = ["XDG_CONFIG_HOME", "LOCALAPPDATA", "APPDATA"];
+  const previous = keys.map((key) => process.env[key]);
+  for (const key of keys) process.env[key] = dir;
   try {
+    assert.equal(findCopilotConfigDirs()[0], join(dir, "github-copilot"));
     // First write creates the github-copilot dir + apps.json.
     const path = writeGitHubToken("gho_first", "alice");
     // Inject a foreign cred (the kind VS Code/gh writes) directly, then write
@@ -109,8 +112,10 @@ test("writeGitHubToken round-trips and preserves existing keys", () => {
     const tokens = readGitHubTokens();
     assert.ok(tokens.some((t) => t.token === "gho_second"));
   } finally {
-    if (prevXdg === undefined) delete process.env.XDG_CONFIG_HOME;
-    else process.env.XDG_CONFIG_HOME = prevXdg;
+    for (const [index, key] of keys.entries()) {
+      if (previous[index] === undefined) delete process.env[key];
+      else process.env[key] = previous[index];
+    }
     rmSync(dir, { recursive: true, force: true });
   }
 });
