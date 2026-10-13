@@ -289,10 +289,7 @@ function Invoke-Uninstall {
         Remove-ItemProperty -Path $runKey -Name $TaskName -ErrorAction SilentlyContinue
         Write-Info "removed logon auto-start $runKey\$TaskName"
     }
-    # Stop any running bridge started via the fallback.
-    Get-CimInstance Win32_Process -Filter "Name='node.exe'" -ErrorAction SilentlyContinue |
-        Where-Object { $_.CommandLine -like "*$DistEntry*" } |
-        ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
+    Stop-RunningBridge
 
     if (Test-Path $Wrapper) {
         Remove-Item $Wrapper -Force
@@ -311,6 +308,44 @@ function Invoke-Uninstall {
         [Environment]::SetEnvironmentVariable('Path', ($parts -join ';'), 'User')
     }
     Write-Info "ai-bridge uninstalled. (Build output in dist\ and config in ~/.claude were left in place.)"
+}
+
+function Convert-ToProcessMatchPath {
+    param([string]$Path)
+    return ([System.IO.Path]::GetFullPath($Path).TrimEnd('\').Replace('/', '\').ToLowerInvariant())
+}
+
+function Get-AiBridgeProcesses {
+    $distNeedle = Convert-ToProcessMatchPath $DistEntry
+    $launcherNeedle = Convert-ToProcessMatchPath $ServiceLauncher
+
+    Get-CimInstance Win32_Process -ErrorAction SilentlyContinue |
+        Where-Object {
+            $_.Name -in @('node.exe', 'cmd.exe') -and
+            $_.CommandLine -and
+            (
+                $_.CommandLine.Replace('/', '\').ToLowerInvariant().Contains($distNeedle) -or
+                $_.CommandLine.Replace('/', '\').ToLowerInvariant().Contains($launcherNeedle)
+            )
+        }
+}
+
+function Stop-RunningBridge {
+    Stop-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue
+
+    Get-AiBridgeProcesses | ForEach-Object {
+        Write-Info "stopping existing ai-bridge process $($_.ProcessId): $($_.Name)"
+        Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue
+    }
+
+    $deadline = (Get-Date).AddSeconds(5)
+    do {
+        $stillRunning = Get-AiBridgeProcesses | Select-Object -First 1
+        if (-not $stillRunning) { return }
+        Start-Sleep -Milliseconds 250
+    } while ((Get-Date) -lt $deadline)
+
+    throw "could not stop existing ai-bridge process $($stillRunning.ProcessId). Stop it manually, then re-run."
 }
 
 # =============================================================================
@@ -749,6 +784,11 @@ if ($UnregisterTaskOnly) {
 $nodeBin = Invoke-Preflight
 Invoke-Build -NodeBin $nodeBin
 Invoke-DetectProxy
+# Replace any already-running bridge before port selection and startup. Otherwise
+# a reinstall can leave the old node process alive with stale in-memory GitHub
+# credentials, so it keeps returning token-exchange 401s even though login wrote a
+# fresh credential file.
+Stop-RunningBridge
 # Choose a free port BEFORE writing the wrapper, service launcher, or login config
 # -- they all bake in $Port (via $env:AI_BRIDGE_PORT), so it must be settled first.
 Select-Port              -NodeBin $nodeBin

@@ -37,7 +37,7 @@ Registers a **Scheduled Task** that starts ai-bridge at logon and restarts it on
 
 ```bash
 ai-bridge login     # GitHub device-flow sign-in to Copilot
-ai-bridge model     # optional: pick a model (default: claude-opus-4.8)
+ai-bridge model     # optional: pick a model (default: gpt-5.5)
 claude              # use Claude Code as usual
 ```
 

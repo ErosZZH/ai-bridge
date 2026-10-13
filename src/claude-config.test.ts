@@ -13,8 +13,8 @@ import {
   writeClaudeSettings,
 } from "./claude-config.js";
 
-test("default model matches the Copilot catalog id for Opus 4.8", () => {
-  assert.equal(DEFAULT_MODEL, "claude-opus-4.8");
+test("default model matches a current Copilot catalog id", () => {
+  assert.equal(DEFAULT_MODEL, "gpt-5.5");
 });
 
 test("withClaudeCode1mSuffix tags only in-band windows", () => {

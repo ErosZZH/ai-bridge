@@ -16,7 +16,7 @@ export const AUTH_TOKEN_VALUE = "ai-bridge";
 // Default model written on `ai-bridge login`. This must match the exact Copilot
 // catalog id shown by `ai-bridge model`; Claude Code's [1m] suffix (if
 // applicable) is applied by withClaudeCode1mSuffix at write time.
-export const DEFAULT_MODEL = "claude-opus-4.8";
+export const DEFAULT_MODEL = "gpt-5.5";
 
 const CLAUDE_MODEL_1M_SUFFIX = "[1m]";
 // Band edges (not hard caps) bracketing real 1M models, which advertise

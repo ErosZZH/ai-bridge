@@ -137,3 +137,24 @@ test("tries the next disk token when the first fails", async () => {
   const t = await getCopilotToken();
   assert.equal(t.token, "copilot-ok");
 });
+
+test("token exchange 401 re-reads disk once before failing", async () => {
+  let disk: GitHubToken[] = [{ token: "oauth-stale", user: "rick" }];
+  let calls = 0;
+  __setAuthDeps({
+    readTokens: () => disk,
+    fetch: async (_url, init) => {
+      calls++;
+      const auth = (init?.headers as Record<string, string>).Authorization;
+      if (auth.includes("oauth-stale")) {
+        disk = [{ token: "oauth-fresh", user: "rick" }];
+        return jsonResponse({ message: "Bad credentials" }, 401);
+      }
+      return jsonResponse({ token: "copilot-ok", expires_at: FAR_FUTURE });
+    },
+  });
+
+  const t = await getCopilotToken();
+  assert.equal(t.token, "copilot-ok");
+  assert.equal(calls, 2);
+});

@@ -212,6 +212,20 @@ async function exchangeAny(tokens: GitHubToken[]): Promise<CopilotToken> {
   throw lastErr ?? new CopilotAuthError(SIGN_IN_HINT);
 }
 
+async function exchangeWithDiskRefresh(): Promise<CopilotToken> {
+  const tokens = ensureTokens();
+  if (tokens.length === 0) throw new CopilotAuthError(SIGN_IN_HINT);
+
+  try {
+    return await exchangeAny(tokens);
+  } catch (err) {
+    if (!(err instanceof CopilotAuthError) || err.status !== 401) throw err;
+    cached = readTokens();
+    if (cached.length === 0) throw new CopilotAuthError(SIGN_IN_HINT);
+    return exchangeAny(cached);
+  }
+}
+
 let copilot: CopilotToken | null = null;
 let inflight: Promise<CopilotToken> | null = null;
 
@@ -225,10 +239,7 @@ export async function getCopilotToken(): Promise<CopilotToken> {
   if (copilot && isFresh(copilot)) return copilot;
   if (inflight) return inflight;
 
-  const tokens = ensureTokens();
-  if (tokens.length === 0) throw new CopilotAuthError(SIGN_IN_HINT);
-
-  inflight = exchangeAny(tokens)
+  inflight = exchangeWithDiskRefresh()
     .then((t) => {
       copilot = t;
       return t;
